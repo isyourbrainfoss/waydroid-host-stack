@@ -1,0 +1,2 @@
+# /dev/socket/waydroid_bt    u:object_r:waydroid_bt_socket:s0
+/dev/socket/waydroid_bt    u:object_r:socket_device:s0

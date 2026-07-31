@@ -1,0 +1,17 @@
+/target/
+**/*.o
+**/*.so
+**/*.a
+/tmp/
+*.img
+*.img.xz
+*.BIN
+*.bin
+.DS_Store
+*.swp
+*~
+.idea/
+.vscode/
+# Local HAL rebuild scratch
+/hal-out/
+/soft-hci-rebuild/

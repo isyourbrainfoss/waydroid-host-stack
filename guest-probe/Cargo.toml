@@ -1,0 +1,15 @@
+[package]
+name = "waydroid-bt-guest-probe"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Guest mount-ns probe for host BlueZ bridge (Ping/scan/GATT)"
+
+[[bin]]
+name = "waydroid-bt-guest-probe"
+path = "src/main.rs"
+
+[dependencies]
+waydroid_bt_protocol = { workspace = true }
+bytes = { workspace = true }
+clap = { version = "4", features = ["derive", "env"] }

@@ -1,0 +1,13 @@
+# SELinux policy sketch for Waydroid guest Bluetooth bridge socket.
+# Merge into device/lineage or waydroid sepolicy when building the image.
+#
+# Domain names may need adjustment for the target Android release.
+
+# Allow bluetooth domain to connect to the host-bridge unix socket.
+# type waydroid_bt_socket, file_type;
+#
+# allow bluetooth waydroid_bt_socket:sock_file write;
+# allow bluetooth waydroid_bt_socket:unix_stream_socket connectto;
+
+# Temporary permissive note for bring-up (do NOT ship):
+# permissive bluetooth;

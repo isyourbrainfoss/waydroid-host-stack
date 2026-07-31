@@ -1,0 +1,6 @@
+# init.rc fragment for Waydroid guest (install under /system/etc/init/ or vendor).
+
+on property:sys.boot_completed=1
+    # Host bridge is bind-mounted; no local daemon required for connectivity test.
+    # Future: start waydroid_bt_backend service here.
+    setprop vendor.waydroid.bt.socket /dev/socket/waydroid_bt

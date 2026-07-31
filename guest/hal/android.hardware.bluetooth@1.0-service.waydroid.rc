@@ -1,0 +1,17 @@
+# Soft HCI HAL for Waydroid (no CAP_* — Waydroid init cannot set capabilities).
+# Wrapper sets LD_LIBRARY_PATH and enforces single instance.
+# Start only once when hwservicemanager is ready (not again on boot_completed —
+# a second start used to spawn a second HAL and break Bluetooth).
+service bluetooth-1-0-waydroid /system/bin/bluetooth-hci-waydroid
+    class main
+    user root
+    group root
+    oneshot
+    disabled
+
+on property:hwservicemanager.ready=true
+    start bluetooth-1-0-waydroid
+
+# If HAL died before boot finished, allow one recovery start (wrapper no-ops if live).
+on property:sys.boot_completed=1
+    start bluetooth-1-0-waydroid

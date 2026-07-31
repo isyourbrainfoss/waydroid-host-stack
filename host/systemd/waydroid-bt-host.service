@@ -1,0 +1,28 @@
+[Unit]
+Description=Waydroid Bluetooth host bridge (BlueZ client)
+Documentation=https://github.com/waydroid-bluetooth/waydroid-bluetooth
+After=bluetooth.service
+Wants=bluetooth.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/waydroid-bt-host --socket /run/waydroid-bt/host.sock
+Restart=on-failure
+RestartSec=2
+# RuntimeDirectory creates /run/waydroid-bt owned by the service user
+RuntimeDirectory=waydroid-bt
+RuntimeDirectoryMode=0755
+# Needs D-Bus system bus access to org.bluez
+BusName=
+
+# Hardening (keep D-Bus and Bluetooth usable)
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/run/waydroid-bt
+# BlueZ / D-Bus
+RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_BLUETOOTH
+
+[Install]
+WantedBy=multi-user.target

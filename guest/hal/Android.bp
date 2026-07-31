@@ -1,0 +1,9 @@
+// Sketch for AOSP product integration. Wire into Waydroid vendor tree.
+// Full binder backend is not yet in this package.
+
+cc_binary {
+    name: "waydroid_bt_client",
+    srcs: ["waydroid_bt_client.c"],
+    cflags: ["-Wall", "-Werror"],
+    // vendor: true,  // enable when building in vendor image
+}
