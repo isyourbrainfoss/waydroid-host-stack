@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Mock GPS seed
+GenericName=Waydroid mock location
+Comment=Inject mock GPS into Waydroid (override MOCK_LAT/LON)
+Exec=waydroid-mock-location toggle
+Icon=find-location
+Terminal=false
+Categories=Utility;System;
+Keywords=gps;location;waydroid;mock;
+StartupNotify=false

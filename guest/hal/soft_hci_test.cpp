@@ -1,15 +1,18 @@
-// Host-side unit tests for SoftHci + bridge IPC wire helpers (no Android HIDL).
+// Host-side unit tests for SoftHci + Soft ATT pure helpers (no Android HIDL).
 #include "bridge_ipc.h"
 #include "soft_hci.h"
+#include "soft_hci_att.h"
 
 #include <cassert>
 #include <cstdio>
 #include <cstring>
+#include <string>
 #include <vector>
 
 using waydroid_bt::BridgeAdv;
 using waydroid_bt::BridgeIpc;
 using waydroid_bt::Packet;
+using waydroid_bt::SoftAttLink;
 using waydroid_bt::SoftHci;
 
 static void test_opcode_of() {
@@ -601,6 +604,220 @@ static void test_status_only_command_complete_shapes() {
          sizeof(cases) / sizeof(cases[0]));
 }
 
+// Host BlueZ property bits win; heuristics only when host_properties == 0.
+static void test_resolve_char_properties_host_first() {
+  const std::string fff4 = waydroid_bt::normalize_uuid("0000fff4-0000-1000-8000-00805f9b34fb");
+  const std::string ordinary = waydroid_bt::normalize_uuid("00002a00-0000-1000-8000-00805f9b34fb");
+
+  // Host reports notify → keep host mask, CCCD required.
+  assert(waydroid_bt::resolve_char_properties(0x10, fff4) == 0x10);
+  assert(waydroid_bt::char_needs_cccd(0x10));
+
+  // Host reports read-only on a UUID that heuristics would notify: do NOT invent notify.
+  assert(waydroid_bt::resolve_char_properties(0x02, fff4) == 0x02);
+  assert(!waydroid_bt::char_needs_cccd(0x02));
+
+  // Unknown host props (0) → heuristic may add notify for streaming UUID.
+  const uint8_t guessed = waydroid_bt::resolve_char_properties(0, fff4);
+  assert((guessed & waydroid_bt::kGattPropNotify) != 0);
+  assert(waydroid_bt::char_needs_cccd(guessed));
+
+  // Unknown props on ordinary name char → read only, no CCCD.
+  const uint8_t name_props = waydroid_bt::resolve_char_properties(0, ordinary);
+  assert(name_props == waydroid_bt::kGattPropRead);
+  assert(!waydroid_bt::char_needs_cccd(name_props));
+
+  printf("ok resolve_char_properties_host_first\n");
+}
+
+// Real SoftAttLink::build_from_uuids: host notify → CCCD present.
+static void test_build_from_uuids_host_notify_gets_cccd() {
+  SoftAttLink link;
+  link.set_conn_handle(0x0040);
+  link.set_peer("AA:BB:CC:DD:EE:10", 1);
+  std::vector<std::pair<std::string, std::vector<SoftAttLink::CharSpec>>> tree = {
+      {"0000fff0-0000-1000-8000-00805f9b34fb",
+       {{"0000fff4-0000-1000-8000-00805f9b34fb", 0x10}}},
+  };
+  link.build_from_uuids(tree);
+  assert(link.active());
+  assert(link.has_cccd_for_char("0000fff4-0000-1000-8000-00805f9b34fb"));
+  assert(link.char_props_for_uuid("0000fff4-0000-1000-8000-00805f9b34fb") == 0x10);
+  printf("ok build_from_uuids_host_notify_gets_cccd attrs=%zu\n", link.attr_count());
+}
+
+// Host read-only must not grow a CCCD even for fff4-like UUID.
+static void test_build_from_uuids_host_readonly_no_cccd() {
+  SoftAttLink link;
+  link.set_peer("AA:BB:CC:DD:EE:11", 1);
+  std::vector<std::pair<std::string, std::vector<SoftAttLink::CharSpec>>> tree = {
+      {"0000fff0-0000-1000-8000-00805f9b34fb",
+       {{"0000fff4-0000-1000-8000-00805f9b34fb", 0x02}}},
+  };
+  link.build_from_uuids(tree);
+  assert(link.active());
+  assert(!link.has_cccd_for_char("0000fff4-0000-1000-8000-00805f9b34fb"));
+  assert(link.char_props_for_uuid("0000fff4-0000-1000-8000-00805f9b34fb") == 0x02);
+  printf("ok build_from_uuids_host_readonly_no_cccd\n");
+}
+
+// Zero host props → heuristic notify for known stream UUID → CCCD.
+static void test_build_from_uuids_zero_props_heuristic_cccd() {
+  SoftAttLink link;
+  link.set_peer("AA:BB:CC:DD:EE:12", 1);
+  std::vector<std::pair<std::string, std::vector<SoftAttLink::CharSpec>>> tree = {
+      {"0000fff0-0000-1000-8000-00805f9b34fb",
+       {{"0000fff4-0000-1000-8000-00805f9b34fb", 0}}},
+  };
+  link.build_from_uuids(tree);
+  assert(link.has_cccd_for_char("fff4"));
+  printf("ok build_from_uuids_zero_props_heuristic_cccd\n");
+}
+
+// Two Soft ATT links: building/activating second must not clear the first.
+static void test_multi_link_soft_att_isolation() {
+  SoftAttLink a;
+  SoftAttLink b;
+  a.set_conn_handle(0x0040);
+  a.set_peer("AA:BB:CC:DD:EE:01", 1);
+  a.build_from_uuids(
+      {{"0000180f-0000-1000-8000-00805f9b34fb",
+        {{"00002a19-0000-1000-8000-00805f9b34fb", 0x12}}}});
+  assert(a.active());
+  assert(a.conn_handle() == 0x0040);
+
+  b.set_conn_handle(0x0041);
+  b.set_peer("AA:BB:CC:DD:EE:02", 1);
+  b.build_from_uuids(
+      {{"0000fff0-0000-1000-8000-00805f9b34fb",
+        {{"0000fff4-0000-1000-8000-00805f9b34fb", 0x10}}}});
+  assert(b.active());
+  assert(b.conn_handle() == 0x0041);
+
+  // First link still alive and independent after second build.
+  assert(a.active());
+  assert(a.conn_handle() == 0x0040);
+  assert(a.peer() == "AA:BB:CC:DD:EE:01");
+  assert(a.has_cccd_for_char("2a19"));
+
+  // Policy helper: different peers preserve each other.
+  assert(waydroid_bt::multi_link_preserves_other_peer(a.peer(), b.peer()));
+  assert(!waydroid_bt::multi_link_preserves_other_peer(a.peer(), a.peer()));
+
+  // Reset B does not affect A.
+  b.reset();
+  assert(!b.active());
+  assert(a.active());
+  assert(a.conn_handle() == 0x0040);
+
+  // Soft HCI Disconnection Complete is per-handle (not a broadcast teardown).
+  Packet d0 = SoftHci::make_disconnection_complete(0x0040, 0x16, 0x00);
+  Packet d1 = SoftHci::make_disconnection_complete(0x0041, 0x13, 0x00);
+  assert(d0[3] == 0x40 && d0[4] == 0x00);
+  assert(d1[3] == 0x41 && d1[4] == 0x00);
+  assert(d0[5] == 0x16 && d1[5] == 0x13);
+
+  printf("ok multi_link_soft_att_isolation\n");
+}
+
+// Notification parse extracts device id for multi-link filtering.
+static void test_parse_gatt_notification_device_id() {
+  // Minimal envelope: event(4) { gatt_notification(4) { device=1 "AA", char=2 "c", value=4 0x01 } }
+  // Built with the same put helpers as BridgeIpc by hand.
+  auto put_varint = [](std::vector<uint8_t>& o, uint64_t v) {
+    while (v >= 0x80) {
+      o.push_back(static_cast<uint8_t>((v & 0x7f) | 0x80));
+      v >>= 7;
+    }
+    o.push_back(static_cast<uint8_t>(v));
+  };
+  auto put_key = [&](std::vector<uint8_t>& o, uint32_t field, uint32_t wire) {
+    put_varint(o, (static_cast<uint64_t>(field) << 3) | wire);
+  };
+  auto put_str = [&](std::vector<uint8_t>& o, uint32_t field, const std::string& s) {
+    put_key(o, field, 2);
+    put_varint(o, s.size());
+    o.insert(o.end(), s.begin(), s.end());
+  };
+  auto put_bytes = [&](std::vector<uint8_t>& o, uint32_t field, const std::vector<uint8_t>& b) {
+    put_key(o, field, 2);
+    put_varint(o, b.size());
+    o.insert(o.end(), b.begin(), b.end());
+  };
+
+  std::vector<uint8_t> gn;
+  put_str(gn, 1, "AA:BB:CC:DD:EE:01");
+  put_str(gn, 2, "0000fff4-0000-1000-8000-00805f9b34fb");
+  put_bytes(gn, 4, {0x01, 0x02});
+
+  std::vector<uint8_t> ev;
+  put_key(ev, 4, 2);
+  put_varint(ev, gn.size());
+  ev.insert(ev.end(), gn.begin(), gn.end());
+
+  std::vector<uint8_t> env;
+  put_key(env, 4, 2);
+  put_varint(env, ev.size());
+  env.insert(env.end(), ev.begin(), ev.end());
+
+  std::string cu, dev;
+  std::vector<uint8_t> val;
+  assert(BridgeIpc::parse_gatt_notification(env.data(), env.size(), &cu, &val, &dev));
+  assert(dev == "AA:BB:CC:DD:EE:01");
+  assert(cu.find("fff4") != std::string::npos);
+  assert(val.size() == 2 && val[0] == 0x01 && val[1] == 0x02);
+  printf("ok parse_gatt_notification_device_id\n");
+}
+
+// Host ok_response omits Response.error when it is 0 (proto3 default). Soft HCI
+// must treat that as success — otherwise set_notify always logs ok=0.
+static void test_parse_response_ok_missing_error_field() {
+  auto put_varint = [](std::vector<uint8_t>& o, uint64_t v) {
+    while (v >= 0x80) {
+      o.push_back(static_cast<uint8_t>((v & 0x7f) | 0x80));
+      v >>= 7;
+    }
+    o.push_back(static_cast<uint8_t>(v));
+  };
+  auto put_key = [&](std::vector<uint8_t>& o, uint32_t field, uint32_t wire) {
+    put_varint(o, (static_cast<uint64_t>(field) << 3) | wire);
+  };
+  auto put_sub = [&](std::vector<uint8_t>& o, uint32_t field, const std::vector<uint8_t>& body) {
+    put_key(o, field, 2);
+    put_varint(o, body.size());
+    o.insert(o.end(), body.begin(), body.end());
+  };
+
+  // Response with only empty gatt_set_notify result (field 20), no error field.
+  std::vector<uint8_t> gsn;  // empty GattSetNotifyResponse
+  std::vector<uint8_t> resp;
+  put_sub(resp, 20, gsn);
+  std::vector<uint8_t> env;
+  put_key(env, 1, 0);
+  put_varint(env, 42);  // request_id
+  put_sub(env, 3, resp);
+  assert(BridgeIpc::parse_response_ok(env.data(), env.size()));
+
+  // Explicit error=0 must still be OK.
+  std::vector<uint8_t> resp0;
+  put_key(resp0, 1, 0);
+  put_varint(resp0, 0);
+  put_sub(resp0, 20, gsn);
+  env.clear();
+  put_sub(env, 3, resp0);
+  assert(BridgeIpc::parse_response_ok(env.data(), env.size()));
+
+  // Explicit non-zero error is failure.
+  std::vector<uint8_t> resp_err;
+  put_key(resp_err, 1, 0);
+  put_varint(resp_err, 5);
+  env.clear();
+  put_sub(env, 3, resp_err);
+  assert(!BridgeIpc::parse_response_ok(env.data(), env.size()));
+
+  printf("ok parse_response_ok_missing_error_field\n");
+}
+
 int main() {
   test_opcode_of();
   test_command_complete_shape();
@@ -625,6 +842,13 @@ int main() {
   test_delete_stored_link_key_return_params();
   test_remote_name_request_status_then_complete();
   test_status_only_command_complete_shapes();
+  test_resolve_char_properties_host_first();
+  test_build_from_uuids_host_notify_gets_cccd();
+  test_build_from_uuids_host_readonly_no_cccd();
+  test_build_from_uuids_zero_props_heuristic_cccd();
+  test_multi_link_soft_att_isolation();
+  test_parse_gatt_notification_device_id();
+  test_parse_response_ok_missing_error_field();
   printf("ALL_SOFT_HCI_TESTS_OK\n");
   return 0;
 }

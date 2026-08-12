@@ -1,0 +1,14 @@
+[Unit]
+Description=Retry waydroid-bt socket inject (gentle)
+# Only re-check occasionally; session-hook exits immediately if LXC is down.
+
+[Timer]
+OnBootSec=30
+# Was 20s — stacked with 90s waits and caused thrash when Waydroid was stopped
+# or when bind mounts failed (ENOSPC / mount races).
+OnUnitActiveSec=120
+AccuracySec=15
+Persistent=false
+
+[Install]
+WantedBy=timers.target

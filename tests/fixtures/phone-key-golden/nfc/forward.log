@@ -1,0 +1,3 @@
+# NFC forward (golden — no live RF required)
+status RUNNING
+skip: no new tag (rate-limited)

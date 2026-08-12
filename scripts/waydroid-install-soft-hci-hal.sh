@@ -1,5 +1,5 @@
 #!/bin/sh
-# Install soft IBluetoothHci HAL + init wrapper into Waydroid overlay.
+# Install soft IBluetoothHci HAL + init wrapper into Waydroid overlay (fajita).
 # Usage (on phone, root):
 #   sudo waydroid-install-soft-hci-hal.sh /path/to/android.hardware.bluetooth@1.0-service.waydroid
 set -eu

@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Install as:
+    /system/etc/permissions/android.hardware.bluetooth.xml
+    (and bluetooth_le variant)
+
+  Or merge into existing device feature lists in the product makefile.
+-->
+<permissions>
+    <feature name="android.hardware.bluetooth" />
+    <feature name="android.hardware.bluetooth_le" />
+</permissions>

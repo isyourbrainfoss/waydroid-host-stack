@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=BT Log Session
+GenericName=Bluetooth field logger
+Comment=Start/stop Bluetooth + Soft HCI logging (Tesla / BLE field test)
+Exec=bt-log-session toggle
+Icon=bluetooth
+Terminal=false
+Categories=Utility;System;Monitor;
+Keywords=bluetooth;tesla;log;waydroid;debug;
+StartupNotify=false

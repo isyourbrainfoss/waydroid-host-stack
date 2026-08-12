@@ -1,5 +1,6 @@
 #include "bridge_ipc.h"
 
+#include <cctype>
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
@@ -80,15 +81,27 @@ bool skip_field(const uint8_t* data, size_t len, size_t& i, uint32_t wire) {
 
 BridgeIpc::~BridgeIpc() { close(); }
 
-void BridgeIpc::close() {
+void BridgeIpc::close_locked() {
+  // Caller holds io_mu_. Do not lock again (mutex is non-recursive).
   if (fd_ >= 0) {
     ::close(fd_);
     fd_ = -1;
   }
 }
 
+void BridgeIpc::close() {
+  // Must serialize with poll/read/write (notify worker vs disconnect path).
+  std::lock_guard<std::mutex> lock(io_mu_);
+  close_locked();
+}
+
+bool BridgeIpc::connected() const {
+  std::lock_guard<std::mutex> lock(io_mu_);
+  return fd_ >= 0;
+}
+
 bool BridgeIpc::connect(const char* path) {
-  close();
+  close();  // public close() takes io_mu_ itself
   int fd = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
   if (fd < 0) {
     return false;
@@ -104,6 +117,7 @@ bool BridgeIpc::connect(const char* path) {
     ::close(fd);
     return false;
   }
+  std::lock_guard<std::mutex> lock(io_mu_);
   fd_ = fd;
   return true;
 }
@@ -512,6 +526,9 @@ std::vector<uint8_t> BridgeIpc::encode_disconnect(uint64_t request_id,
 }
 
 bool BridgeIpc::parse_response_ok(const uint8_t* data, size_t len) {
+  // Response.error is proto3 enum default 0 (OK). Prost/protobuf omit default
+  // fields on the wire, so a successful GattSetNotify/GattWrite response often
+  // has no error field at all — only a result oneof. Treat missing error as OK.
   size_t i = 0;
   while (i < len) {
     uint64_t key;
@@ -525,19 +542,23 @@ bool BridgeIpc::parse_response_ok(const uint8_t* data, size_t len) {
       const uint8_t* resp = data + i;
       size_t rlen = static_cast<size_t>(l);
       size_t j = 0;
+      bool saw_error = false;
+      uint64_t err = 0;
       while (j < rlen) {
         uint64_t k2;
         if (!read_varint(resp, rlen, j, k2)) return false;
         uint32_t f2 = static_cast<uint32_t>(k2 >> 3);
         uint32_t w2 = static_cast<uint32_t>(k2 & 7);
         if (f2 == 1 && w2 == 0) {
-          uint64_t err;
           if (!read_varint(resp, rlen, j, err)) return false;
-          return err == 0;
+          saw_error = true;
+          continue;
         }
         if (!skip_field(resp, rlen, j, w2)) return false;
       }
-      return false;
+      if (saw_error) return err == 0;
+      // No error field → proto3 default OK.
+      return true;
     }
     if (!skip_field(data, len, i, wire)) return false;
   }
@@ -1128,7 +1149,7 @@ bool BridgeIpc::gatt_set_notify_uuid(const std::string& device_id, const std::st
 }
 
 bool BridgeIpc::parse_gatt_notification(const uint8_t* data, size_t len, std::string* char_uuid_out,
-                                        std::vector<uint8_t>* value_out) {
+                                        std::vector<uint8_t>* value_out, std::string* device_id_out) {
   // Envelope { event=4 { gatt_notification=4 { device=1, char=2, service=3, value=4 } } }
   size_t i = 0;
   while (i < len) {
@@ -1155,6 +1176,7 @@ bool BridgeIpc::parse_gatt_notification(const uint8_t* data, size_t len, std::st
           const uint8_t* gn = ev + j;
           size_t glen = static_cast<size_t>(l2);
           size_t k = 0;
+          std::string dev;
           std::string cu;
           std::vector<uint8_t> val;
           while (k < glen) {
@@ -1162,7 +1184,13 @@ bool BridgeIpc::parse_gatt_notification(const uint8_t* data, size_t len, std::st
             if (!read_varint(gn, glen, k, k3)) break;
             uint32_t f3 = static_cast<uint32_t>(k3 >> 3);
             uint32_t w3 = static_cast<uint32_t>(k3 & 7);
-            if (f3 == 2 && w3 == 2) {
+            if (f3 == 1 && w3 == 2) {
+              uint64_t l3;
+              if (!read_varint(gn, glen, k, l3)) break;
+              if (k + l3 > glen) break;
+              dev.assign(reinterpret_cast<const char*>(gn + k), static_cast<size_t>(l3));
+              k += static_cast<size_t>(l3);
+            } else if (f3 == 2 && w3 == 2) {
               uint64_t l3;
               if (!read_varint(gn, glen, k, l3)) break;
               if (k + l3 > glen) break;
@@ -1181,6 +1209,7 @@ bool BridgeIpc::parse_gatt_notification(const uint8_t* data, size_t len, std::st
           if (!cu.empty()) {
             if (char_uuid_out) *char_uuid_out = cu;
             if (value_out) *value_out = std::move(val);
+            if (device_id_out) *device_id_out = std::move(dev);
             return true;
           }
           return false;
@@ -1195,7 +1224,7 @@ bool BridgeIpc::parse_gatt_notification(const uint8_t* data, size_t len, std::st
 }
 
 bool BridgeIpc::poll_gatt_notification(std::string* char_uuid_out, std::vector<uint8_t>* value_out,
-                                       int timeout_ms) {
+                                       int timeout_ms, const std::string& device_id_filter) {
   // Try-lock so set_notify / read / write on the binder thread are not blocked.
   std::unique_lock<std::mutex> lock(io_mu_, std::try_to_lock);
   if (!lock.owns_lock()) {
@@ -1207,23 +1236,43 @@ bool BridgeIpc::poll_gatt_notification(std::string* char_uuid_out, std::vector<u
   pollfd pfd{};
   pfd.fd = fd_;
   pfd.events = POLLIN;
-  // Unlock during poll so other ops can proceed? No — then two threads race on fd.
   // Keep lock for poll+read; timeout is short (caller uses 200ms).
   int pr = ::poll(&pfd, 1, timeout_ms);
   if (pr <= 0) return false;
   if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) {
-    close();
+    // Already hold io_mu_; public close() would self-deadlock.
+    close_locked();
     return false;
   }
   std::vector<uint8_t> frame;
   if (!read_frame(frame)) {
-    close();
+    close_locked();
     return false;
   }
-  return parse_gatt_notification(frame.data(), frame.size(), char_uuid_out, value_out);
+  std::string dev;
+  std::string cu;
+  std::vector<uint8_t> val;
+  if (!parse_gatt_notification(frame.data(), frame.size(), &cu, &val, &dev)) {
+    return false;
+  }
+  if (!device_id_filter.empty() && !dev.empty()) {
+    // Case-insensitive match (BlueZ ids are typically uppercase addresses).
+    std::string a = device_id_filter;
+    std::string b = dev;
+    for (char& c : a) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    for (char& c : b) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    if (a != b) {
+      return false;  // notification for another multi-link peer
+    }
+  }
+  if (char_uuid_out) *char_uuid_out = std::move(cu);
+  if (value_out) *value_out = std::move(val);
+  return true;
 }
 
 bool BridgeIpc::disconnect_device(const std::string& device_id) {
+  // Serialize with poll_gatt_notification / gatt_* on the same unix fd.
+  std::lock_guard<std::mutex> lock(io_mu_);
   if (fd_ < 0) return false;
   if (!write_frame(encode_disconnect(next_rid_++, device_id))) return false;
   for (int tries = 0; tries < 32; tries++) {

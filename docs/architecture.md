@@ -1,89 +1,85 @@
 # Architecture
 
-## Problem
+## Decision: Alternative E (refined)
 
-Android (inside Waydroid) and Linux both want Bluetooth. One physical controller cannot sanely be mastered by two full stacks (Fluoride + BlueZ) at once.
+Full guest Bluetooth **system** path + invisible host bridge to BlueZ.  
+BlueZ is the **only** HCI owner on the phone.
 
-## Decision
+### Rejected approaches
 
-**BlueZ is the sole HCI owner.** Waydroid never receives raw HCI for the real radio.
+| Id | Approach | Why rejected for daily-driver Linux phone |
+|----|----------|-------------------------------------------|
+| A | Exclusive HCI / USB passthrough | Host loses Bluetooth |
+| B | App-classpath `android.bluetooth` stubs | Forever incomplete; Settings/CDM/background break |
+| C | Host-only (no Android BT) | Fails ultimate goal |
+| D | Dual controllers | Awkward/impossible on phones |
+| F | Virtual HCI as second master | Two host stacks fight the controller |
 
-Capability is exported through a **high-level IPC** plus a **Soft HCI** adapter that satisfies Android’s Bluetooth HAL contract.
+### HCI impedance mismatch
 
-## Components
+Stock Fluoride/Gabeldorsche expects `IBluetoothHci` and then runs **its own L2CAP/ATT**. BlueZ also owns L2CAP/ATT for connections it manages. Forwarding raw HCI into BlueZ while both run is broken.
+
+**Sharing rule (unchanged):** ATT/L2CAP/HCI are owned **once** — by BlueZ. The guest never becomes a second HCI master and we do not bind `/dev/hci0` into LXC.
+
+**Shipped field path (LE):** Soft HCI HAL (`IBluetoothHci`) in the guest synthesizes a virtual controller for Fluoride. Scan, LE create-connection, and GATT are intercepted and sent over the Unix socket to `waydroid-bt-host` → BlueZ. Tesla Phone Key is proven on this path. Soft HCI is **not** exclusive HCI passthrough and **not** a second radio owner.
+
+**Cleanup north star (Strategy A):** map guest `IBluetooth` / `IBluetoothGatt` directly to the same BlueZ IPC so Settings / CompanionDeviceManager / background LE do not depend on covering every HCI opcode. Strategy A is **not** the current field stack; do not rip out Soft HCI until that binder backend exists and Phone Key still works.
+
+### Components
 
 ```
-┌─ Linux host ─────────────────────────────────────────┐
-│  Desktop BT tools / system apps                      │
-│           │                                          │
-│           ▼                                          │
-│        BlueZ (bluetoothd)  ◄── only HCI + bonds      │
-│           ▲                                          │
-│           │ D-Bus (bluer)                            │
-│  waydroid-bt-host                                    │
-│           ▲                                          │
-│  Unix socket (e.g. /run/waydroid-bt/host.sock)       │
-└───────────│──────────────────────────────────────────┘
+┌─ Linux host ─────────────────────────────────────────────┐
+│  bluetui / Phosh / PipeWire                              │
+│           │                                              │
+│           ▼                                              │
+│        BlueZ (bluetoothd)  ◄── sole HCI + bond DB        │
+│           ▲                                              │
+│           │ D-Bus (bluer)                                │
+│  waydroid-bt-host.service                                │
+│           ▲                                              │
+│  /run/waydroid-bt/host.sock                              │
+└───────────│──────────────────────────────────────────────┘
             │ LXC bind-mount
-┌───────────▼──────────────────────────────────────────┐
-│  Waydroid                                            │
-│  Soft HCI HAL  (IBluetoothHci)                       │
-│    • LE scan / connect HCI events                    │
-│    • Soft ATT (per-connection GATT tables)           │
-│    • bridge_ipc → host protobuf                      │
-│           ▲                                          │
-│  Android Bluetooth stack + apps                      │
-└──────────────────────────────────────────────────────┘
+┌───────────▼──────────────────────────────────────────────┐
+│  Waydroid                                                │
+│  /dev/socket/waydroid_bt                                 │
+│           ▲                                              │
+│  Soft HCI HAL (shipped) → BlueZ IPC (not chip HCI)       │
+│           ▲                                              │
+│  BluetoothManagerService / framework APIs                │
+│           ▲                                              │
+│  Apps                                                    │
+└──────────────────────────────────────────────────────────┘
 ```
 
-## Soft HCI
+## Policy
 
-Implements enough HCI commands/events for Android BLE bring-up and LE links:
+| Concern | Rule |
+|---------|------|
+| Power on/off | Host BlueZ is truth. Guest “off” → **soft-disable** (guest sees off; radio stays up). `force_host` optional for explicit BlueZ power. |
+| Address / privacy | One identity from BlueZ |
+| Bonds | Stored in BlueZ |
+| Discovery | Refcounted sessions (host UI + guest) |
+| Kill Waydroid | Host BT unaffected; sessions cleared |
+| Kill BlueZ | Guest sees adapter unavailable |
 
-- Controller info / LE feature bits  
-- Scan enable → host discovery  
-- LE Create Connection → host connect + GATT discover  
-- ACL carrying ATT for Soft ATT  
-- Disconnect complete per handle  
+## ADR-001: Guest integration
 
-It does **not** implement a second radio stack.
+**Status:** Field default is Soft HCI. Strategy A remains the cleanup north star.
 
-## Soft ATT
+| Layer | What we run today | North star |
+|-------|-------------------|------------|
+| Guest stack | Restored Fluoride / Gabeldorsche | Unchanged |
+| Vendor HAL | Soft HCI (`IBluetoothHci`) → host socket | Strategy A: `IBluetooth` / `IBluetoothGatt` → same socket |
+| Host | `waydroid-bt-host` + BlueZ (sole HCI + ATT) | Unchanged |
+| Classic audio | Out of scope (A2DP/HFP + PipeWire) | Still out of scope |
 
-For each concurrent LE peer:
+**Shipped:** Soft HCI LE GATT (multi-link), Phone Key proven. High-level scan/connect/GATT still go to BlueZ; the Soft HCI layer is a virtual controller, not a second chip master.
 
-- Stable HCI **connection handle**  
-- Synthetic GATT attribute table (handles local to Soft ATT)  
-- Properties from host discovery when available; UUID heuristics as fallback  
-- CCCD writes → host `set_notify`  
-- Host notification bytes → Handle Value Notification  
+**Cleanup (Strategy A):** BlueZ-backed Bluetooth **system service backend** over the host socket so Settings/CDM/background LE do not require every HCI opcode. Do not replace Soft HCI in this tree until that backend is proven on-device.
 
-Multi-link: connecting device B does **not** tear down device A.
+**Still rejected:** exclusive HCI / USB passthrough (host loses BT); app-classpath stubs; dual controllers; forwarding raw HCI into BlueZ while Fluoride also runs ATT.
 
-## Host service
+## Protocol
 
-`waydroid-bt-host`:
-
-- Listens on a Unix stream socket  
-- Frames: 4-byte little-endian length + protobuf `Envelope`  
-- Ops: adapter info, LE scan, connect, disconnect, GATT discover/read/write/notify, bonds (as implemented)  
-- Events: adv reports, connection state, GATT notifications  
-
-See [protocol.md](protocol.md) and `protocol/proto/`.
-
-## Failure modes to expect
-
-| Symptom | Typical cause |
-|---------|----------------|
-| No adapters in guest | Soft HCI not running / stack not bound |
-| Scan empty | Host socket missing, discovery blocked, or scan hold too short |
-| Connect 133 / timeout | Host connect failed, residual handle without disconnect complete, or image BT broken |
-| Connected but no notify | CCCD not wired, host notify stream dead, or wrong characteristic properties |
-| Host BT dies when guest starts | Accidental HCI passthrough / wrong HAL — not this design |
-
-## Future directions (not required for basic GATT)
-
-- ATT PDU proxy for odd GATT layouts  
-- L2CAP CoC byte streams for non-GATT LE protocols  
-- Richer bonding UX  
-- Distro packages for host + mount  
+See [protocol.md](protocol.md). Version **1.0**, LE-first.

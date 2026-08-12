@@ -1,0 +1,3 @@
+# Soft HCI host bridge tail (golden)
+[soft-hci] sock=/run/waydroid-bt/host.sock state=up
+[soft-hci] links=1 gatt=active

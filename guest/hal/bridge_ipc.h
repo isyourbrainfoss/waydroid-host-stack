@@ -49,7 +49,7 @@ class BridgeIpc {
   // Connect to unix stream socket (e.g. /run/waydroid-bt/host.sock).
   bool connect(const char* path);
   void close();
-  bool connected() const { return fd_ >= 0; }
+  bool connected() const;
 
   // Start LE scan (active). Returns session_id or 0 on failure.
   uint32_t start_le_scan(bool active = true);
@@ -86,8 +86,10 @@ class BridgeIpc {
 
   // Wait up to timeout_ms for GattNotificationEvent (field 4 / event.gatt_notification).
   // Used by Soft HCI ATT bridge to inject Handle Value Notifications into Fluoride.
+  // If device_id_filter is non-empty, only accept notifications for that host device
+  // (multi-link isolation when host fans out events to every guest client).
   bool poll_gatt_notification(std::string* char_uuid_out, std::vector<uint8_t>* value_out,
-                              int timeout_ms);
+                              int timeout_ms, const std::string& device_id_filter = {});
 
   // Pure helpers (unit-testable):
   static std::vector<uint8_t> encode_start_le_scan(uint64_t request_id, bool active);
@@ -112,13 +114,17 @@ class BridgeIpc {
       std::vector<std::pair<std::string, std::vector<GattChar>>>* out);
   static bool parse_gatt_read_value(const uint8_t* data, size_t len, std::vector<uint8_t>* value_out);
   static bool parse_gatt_notification(const uint8_t* data, size_t len, std::string* char_uuid_out,
-                                      std::vector<uint8_t>* value_out);
+                                      std::vector<uint8_t>* value_out,
+                                      std::string* device_id_out = nullptr);
 
  private:
   bool write_all(const uint8_t* data, size_t len);
   bool read_exact(uint8_t* data, size_t len);
   bool read_frame(std::vector<uint8_t>& payload);
   bool write_frame(const std::vector<uint8_t>& payload);
+
+  // Close socket; caller must already hold io_mu_ (non-recursive).
+  void close_locked();
 
   int fd_ = -1;
   uint64_t next_rid_ = 100;

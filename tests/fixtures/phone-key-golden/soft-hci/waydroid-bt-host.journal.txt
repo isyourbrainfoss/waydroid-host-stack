@@ -1,0 +1,5 @@
+# Soft HCI host journal snippet (golden fixture)
+Aug 04 20:09:18 fajita waydroid-bt-host[1200]: listening on /run/waydroid-bt/host.sock
+Aug 04 20:09:19 fajita waydroid-bt-host[1200]: guest connected; BlueZ adapter powered
+Aug 04 20:09:44 fajita waydroid-bt-host[1200]: LE GATT multi-link: VCSEC service advertised path ok
+Aug 04 20:09:55 fajita waydroid-bt-host[1200]: inject ok (Phone Key status notify)

@@ -10,7 +10,7 @@ default-members = ["host"]
 [workspace.package]
 edition = "2021"
 license = "MIT"
-repository = "https://github.com/isyourbrainfoss/waydroid-bluetooth"
+repository = "https://github.com/waydroid-bluetooth/waydroid-bluetooth"
 version = "0.1.0"
 
 [workspace.dependencies]

@@ -1,0 +1,34 @@
+# Contributor: waydroid-bluetooth
+# Maintainer: waydroid-bluetooth
+pkgname=waydroid-bt-host
+pkgver=0.1.0
+pkgrel=0
+pkgdesc="Host bridge: Waydroid Bluetooth backend over BlueZ"
+url="https://github.com/waydroid-bluetooth/waydroid-bluetooth"
+arch="all"
+license="MIT"
+depends="bluez dbus"
+makedepends="cargo rust protobuf-dev dbus-dev pkgconf"
+source=""
+builddir="$srcdir/waydroid-bluetooth"
+
+# When packaging from git:
+# source="waydroid-bluetooth-$pkgver.tar.gz::https://..."
+# Or use abuild with options="net" and cargo fetch in prepare().
+
+build() {
+	# Expect builddir to be the monorepo root (adjust for your source layout).
+	cargo build --release --locked -p waydroid-bt-host || \
+		cargo build --release -p waydroid-bt-host
+}
+
+check() {
+	cargo test --workspace --release || cargo test --workspace
+}
+
+package() {
+	install -Dm755 target/release/waydroid-bt-host \
+		"$pkgdir"/usr/bin/waydroid-bt-host
+	install -Dm644 host/systemd/waydroid-bt-host.service \
+		"$pkgdir"/usr/lib/systemd/system/waydroid-bt-host.service
+}

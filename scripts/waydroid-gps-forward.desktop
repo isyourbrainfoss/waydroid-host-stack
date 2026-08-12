@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Waydroid GPS Forward
+GenericName=Host GPS → Waydroid
+Comment=Forward Linux/GeoClue location into Waydroid (uses last known if no signal)
+Exec=waydroid-gps-forward toggle
+Icon=find-location
+Terminal=false
+Categories=Utility;System;
+Keywords=gps;location;waydroid;geoclue;forward;

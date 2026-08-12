@@ -28,8 +28,8 @@ MOV_W0_IMM9 = struct.pack("<I", 0x52800000 | (9 << 5))  # 20 01 80 52
 MOV_W0_IMM7 = struct.pack("<I", 0x52800000 | (7 << 5))  # e0 00 80 52
 
 # Known file offsets of `mov w0, #9` before timerfd_create@plt in Lineage 20
-# TQ3A / A13 libbluetooth_jni.so (both stock waydroid and lineage common aarch64 images).
-# Verified against BuildID-bearing A13 aarch64 library used .
+# TQ3A / A13 libbluetooth_jni.so (both stock waydroid and lineage fajita/taimen).
+# Verified against BuildID-bearing A13 aarch64 library used on fajita overlay.
 DEFAULT_SITES = (0xAAD400, 0xAAF340, 0xB34BC8)
 
 

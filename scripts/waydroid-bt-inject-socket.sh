@@ -38,6 +38,19 @@ if [ -z "${PID:-}" ] || [ "$PID" = "-1" ]; then
 fi
 
 GUEST_MNT="/proc/$PID/root$GUESTDIR"
+
+# Prefer permanent LXC mount (config_nodes). Runtime bind is a fallback only.
+if [ -S "$GUEST_MNT/host.sock" ]; then
+	echo "INJECT_OK already present pid=$PID (LXC or prior bind)"
+	exit 0
+fi
+
+# Safety: never bind if guest path is the same inode as host (self-bind stack).
+if [ -e "$GUEST_MNT" ] && [ "$(stat -c '%d:%i' "$HOSTDIR" 2>/dev/null)" = "$(stat -c '%d:%i' "$GUEST_MNT" 2>/dev/null)" ]; then
+	echo "REFUSE: guest path same inode as host $HOSTDIR (would stack self-binds)" >&2
+	exit 1
+fi
+
 mkdir -p "$GUEST_MNT"
 
 need_bind=0
@@ -45,16 +58,23 @@ if ! mountpoint -q "$GUEST_MNT" 2>/dev/null; then
 	need_bind=1
 elif [ ! -S "$GUEST_MNT/host.sock" ]; then
 	# Stale/empty mount — remount
-	umount "$GUEST_MNT" 2>/dev/null || true
+	umount "$GUEST_MNT" 2>/dev/null || umount -l "$GUEST_MNT" 2>/dev/null || true
 	need_bind=1
 fi
 
 if [ "$need_bind" -eq 1 ]; then
-	mount --bind "$HOSTDIR" "$GUEST_MNT"
+	# ENOSPC here is often mount-table pressure, not full disk. Fail fast.
+	if ! mount --bind "$HOSTDIR" "$GUEST_MNT" 2>/tmp/waydroid-bt-inject-mount.err; then
+		err=$(cat /tmp/waydroid-bt-inject-mount.err 2>/dev/null || true)
+		echo "inject bind failed: $err" >&2
+		echo "hint: ensure lxc.mount.entry for /run/waydroid-bt in config_nodes and restart container" >&2
+		exit 1
+	fi
 fi
 
 if [ ! -S "$GUEST_MNT/host.sock" ]; then
 	echo "inject failed: guest $GUESTDIR/host.sock missing after bind" >&2
+	umount "$GUEST_MNT" 2>/dev/null || true
 	exit 1
 fi
 

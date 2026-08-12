@@ -1,0 +1,12 @@
+# Synthetic golden Phone Key path (whitelist → unlocked).
+# Mirrors real session-20260804-200918 pattern for desk timeline proof.
+# Not a live capture — field evidence still lives in real pull trees.
+
+08-04 20:09:20.100  4123  4201 I BLEVehicleController: Did NOT find key for vehicle in whitelist
+08-04 20:09:22.340  4123  4201 I BLEVehicleController: scanning for VCSEC service b2d1...
+08-04 20:09:45.012  4123  4201 I BLEVehicleController: Found [a1b2c3d4e5f6] in whitelist!
+08-04 20:09:45.100  4123  4201 I BLEVehicleController: already in whitelist for this vehicle
+08-04 20:09:48.550  4123  4201 I BLEVehicleController: Got vehicle status: locked presence=NEAR
+08-04 20:09:52.880  4123  4201 I BLEVehicleController: authenticating via Soft HCI GATT...
+08-04 20:09:55.210  4123  4201 I BLEVehicleController: Got vehicle status: unlocked presence=INSIDE
+08-04 20:09:55.400  4123  4201 I BLEVehicleController: Phone Key unlock path complete

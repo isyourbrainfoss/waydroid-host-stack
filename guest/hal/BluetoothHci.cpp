@@ -28,27 +28,36 @@ BluetoothHci::BluetoothHci() {
   soft_.set_le_create_connection_hook(
       [this](const uint8_t peer[6], uint8_t t) { onLeCreateConnection(peer, t); });
   soft_.set_disconnect_hook([this](uint16_t handle, uint8_t /*reason*/) {
-    std::vector<std::thread> joiners;
+    // Join notify worker after signaling stop+close, but only erase after the
+    // worker can no longer observe the session map entry (shared_ptr keeps IPC).
+    std::thread joiner;
+    std::shared_ptr<waydroid_bt::BridgeIpc> ipc;
+    std::string peer;
+    std::string device_id;
     {
       std::lock_guard<std::mutex> lock(att_mu_);
       auto it = att_sessions_.find(handle);
       if (it == att_sessions_.end()) return;
+      peer = it->second->peer;
+      device_id = it->second->device_id;
       it->second->notify_run.store(false);
-      if (it->second->ipc) {
-        if (!it->second->device_id.empty()) {
-          it->second->ipc->disconnect_device(it->second->device_id);
-        }
-        it->second->ipc->close();
-      }
+      ipc = it->second->ipc;
       if (it->second->notify_thread.joinable()) {
-        joiners.push_back(std::move(it->second->notify_thread));
+        joiner = std::move(it->second->notify_thread);
       }
-      ALOGI("Soft HCI Disconnect hook close ATT session handle=0x%04x peer=%s", handle,
-            it->second->peer.c_str());
+      // Drop session entry; worker may still hold shared_ptr<BridgeIpc>.
       att_sessions_.erase(it);
+      ALOGI("Soft HCI Disconnect hook close ATT session handle=0x%04x peer=%s", handle,
+            peer.c_str());
     }
-    for (auto& t : joiners) {
-      if (t.joinable()) t.join();
+    if (ipc) {
+      if (!device_id.empty()) {
+        ipc->disconnect_device(device_id);
+      }
+      ipc->close();  // unblocks poll under io_mu_
+    }
+    if (joiner.joinable()) {
+      joiner.join();
     }
   });
   event_thread_ = std::thread([this]() { eventWorker(); });
@@ -66,6 +75,7 @@ BluetoothHci::~BluetoothHci() {
     std::lock_guard<std::mutex> lock(att_mu_);
     closeAllAttSessionsLocked(/*inject_hci_disconnect=*/false);
   }
+  drainPendingNotifyJoins();
   if (event_thread_.joinable()) {
     event_thread_.join();
   }
@@ -124,38 +134,29 @@ uint16_t BluetoothHci::aclHandleOf(const waydroid_bt::Packet& acl) {
 }
 
 void BluetoothHci::closeAttSessionLocked(uint16_t handle, bool inject_hci_disconnect) {
-  // caller holds att_mu_ — do not join notify thread while holding att_mu_.
+  // Caller holds att_mu_. Must NOT call BridgeIpc::close/disconnect while
+  // holding att_mu_ (worker: io_mu_ then att_mu_ → ABBA deadlock with
+  // att_mu_ then io_mu_). Extract shared_ptr + thread, erase map, queue
+  // post-work for drainPendingNotifyJoins() after unlock.
   auto it = att_sessions_.find(handle);
   if (it == att_sessions_.end()) return;
   AttSession* s = it->second.get();
   const bool was_active = s->link.active();
   const std::string peer = s->peer;
+  PendingIpcClose pc;
+  pc.ipc = s->ipc;
+  pc.device_id = s->device_id;
+  pc.inject_dc = inject_hci_disconnect && was_active;
+  pc.handle = handle;
+  pc.peer = peer;
   s->notify_run.store(false);
-  if (s->ipc && !s->device_id.empty()) {
-    s->ipc->disconnect_device(s->device_id);
-  }
-  if (s->ipc) {
-    s->ipc->close();
-  }
-  // Detach thread for join outside lock by caller if needed — store joinable
-  // thread in a temporary moved out... caller of closeAll handles join.
-  // For single close we join after erase if we move the thread out.
-  std::thread joiner;
   if (s->notify_thread.joinable()) {
-    joiner = std::move(s->notify_thread);
+    pc.joiner = std::move(s->notify_thread);
   }
   att_sessions_.erase(it);
-  if (inject_hci_disconnect && was_active) {
-    soft_.inject_disconnection_complete(handle, 0x16 /* local host terminated */);
-    ALOGI("Soft HCI inject Disconnection Complete handle=0x%04x peer=%s", handle, peer.c_str());
-  }
-  // Join after erase so notify worker is not looking at destroyed session.
-  // Unlock is caller's problem if they hold the lock — joining while holding
-  // att_mu_ deadlocks the worker. So only detach here; public wrappers join.
-  if (joiner.joinable()) {
-    // Cannot join while holding att_mu_ if worker takes att_mu_. Detach is
-    // safer; worker exits when notify_run is false and ipc closed.
-    joiner.detach();
+  {
+    std::lock_guard<std::mutex> jl(pending_join_mu_);
+    pending_closes_.push_back(std::move(pc));
   }
 }
 
@@ -168,17 +169,44 @@ void BluetoothHci::closeAllAttSessionsLocked(bool inject_hci_disconnect) {
   }
 }
 
+void BluetoothHci::drainPendingNotifyJoins() {
+  std::vector<PendingIpcClose> work;
+  {
+    std::lock_guard<std::mutex> jl(pending_join_mu_);
+    work.swap(pending_closes_);
+  }
+  for (auto& pc : work) {
+    if (pc.ipc) {
+      if (!pc.device_id.empty()) {
+        pc.ipc->disconnect_device(pc.device_id);
+      }
+      pc.ipc->close();  // under io_mu_; wakes poll
+    }
+    if (pc.inject_dc) {
+      soft_.inject_disconnection_complete(pc.handle, 0x16 /* local host terminated */);
+      ALOGI("Soft HCI inject Disconnection Complete handle=0x%04x peer=%s", pc.handle,
+            pc.peer.c_str());
+    }
+    if (pc.joiner.joinable()) {
+      pc.joiner.join();
+    }
+  }
+}
+
 void BluetoothHci::attNotifyWorker(uint16_t handle) {
   ALOGI("Soft HCI ATT notify worker started handle=0x%04x", handle);
   while (!stop_.load()) {
-    waydroid_bt::BridgeIpc* ipc = nullptr;
+    std::shared_ptr<waydroid_bt::BridgeIpc> ipc;
+    std::string device_id;
     bool run = false;
     {
       std::lock_guard<std::mutex> lock(att_mu_);
       AttSession* s = findSessionByHandleLocked(handle);
       if (!s) break;
       run = s->notify_run.load();
-      ipc = s->ipc.get();
+      // Copy shared_ptr so session erase cannot free BridgeIpc under our feet.
+      ipc = s->ipc;
+      device_id = s->device_id;
     }
     if (!run) break;
     if (!ipc || !ipc->connected()) {
@@ -187,11 +215,13 @@ void BluetoothHci::attNotifyWorker(uint16_t handle) {
     }
     std::string cu;
     std::vector<uint8_t> val;
-    if (!ipc->poll_gatt_notification(&cu, &val, 200)) {
+    // Filter by host device_id so multi-link peers never inject each other's HVNs
+    // (host may fan-out GattNotification events to every guest client).
+    if (!ipc->poll_gatt_notification(&cu, &val, 200, device_id)) {
       continue;
     }
-    ALOGI("Soft HCI ATT host notify handle=0x%04x char=%s len=%zu", handle, cu.c_str(),
-          val.size());
+    ALOGI("Soft HCI ATT host notify handle=0x%04x peer=%s char=%s len=%zu", handle,
+          device_id.c_str(), cu.c_str(), val.size());
     std::lock_guard<std::mutex> lock(att_mu_);
     AttSession* s = findSessionByHandleLocked(handle);
     if (!s || !s->link.active()) continue;
@@ -454,7 +484,7 @@ void BluetoothHci::leConnectWorker() {
     scan_cv_.notify_all();
     std::this_thread::sleep_for(std::chrono::milliseconds(500));
 
-    auto ipc = std::make_unique<waydroid_bt::BridgeIpc>();
+    auto ipc = std::make_shared<waydroid_bt::BridgeIpc>();
     bool ok = false;
     std::string device_id;
     std::string summary;
@@ -536,12 +566,15 @@ void BluetoothHci::leConnectWorker() {
         }
         return false;
       };
+      // Only complete a partial Pressensor tree when host already reported
+      // Pressensor UUIDs. Never invent Pressensor/Battery services on unrelated
+      // peers (Tesla, etc.) — that polluted Soft ATT and confused apps.
       const bool looks_decent =
           has_uuid(services, "fff0") || has_uuid(services, "fff4") || has_uuid(services, "36f5");
       const bool looks_pressensor = has_uuid(services, "873ae82");
-      if (!looks_decent) {
+      if (looks_pressensor) {
         if (!has_uuid(services, "873ae82a")) {
-          ALOGI("Soft HCI ATT inject Pressensor service 873ae82a (host missing)");
+          ALOGI("Soft HCI ATT complete Pressensor service 873ae82a (host partial)");
           services.push_back(
               {"873ae82a-4c5a-4342-b539-9d900bf7ebd0",
                {{"873ae82b-4c5a-4342-b539-9d900bf7ebd0", 0x12},
@@ -558,8 +591,10 @@ void BluetoothHci::leConnectWorker() {
               {"0000180f-0000-1000-8000-00805f9b34fb",
                {{"00002a19-0000-1000-8000-00805f9b34fb", 0x12}}});
         }
+      } else if (looks_decent) {
+        ALOGI("Soft HCI ATT Decent/fff0 tree — no Pressensor inject");
       } else {
-        ALOGI("Soft HCI ATT Decent/fff0 tree — skip Pressensor inject");
+        ALOGI("Soft HCI ATT host tree only (no synthetic Pressensor) peer=%s", addr_str);
       }
       ALOGI("Soft HCI ATT build peer=%s looks_decent=%d looks_pressensor=%d services=%zu "
             "active_links=%zu",
@@ -630,6 +665,7 @@ Return<void> BluetoothHci::close() {
     std::lock_guard<std::mutex> lock(att_mu_);
     closeAllAttSessionsLocked(/*inject_hci_disconnect=*/true);
   }
+  drainPendingNotifyJoins();
   std::lock_guard<std::mutex> lock(mu_);
   callbacks_ = nullptr;
   return Void();

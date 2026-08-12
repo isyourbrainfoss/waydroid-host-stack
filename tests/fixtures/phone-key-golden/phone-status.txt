@@ -1,0 +1,5 @@
+# phone-key-ready-style snapshot (golden)
+HOST_BIN=1 UNIT_ACTIVE=1 SOCK=1 BLUEZ_POWERED=yes
+SESSION=RUNNING IP=192.168.240.112 BOOT=1 GUEST_BT=ok
+waydroid_boot=full
+READY

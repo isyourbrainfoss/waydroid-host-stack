@@ -1,17 +1,29 @@
 /target/
+**/*.rs.bk
 **/*.o
 **/*.so
 **/*.a
-/tmp/
-*.img
-*.img.xz
-*.BIN
-*.bin
-.DS_Store
 *.swp
+*.swo
 *~
 .idea/
 .vscode/
-# Local HAL rebuild scratch
+.DS_Store
+
+# Images / firmware / dumps — never publish
+*.img
+*.img.xz
+*.zip
+*.BIN
+*.bin
+/artifacts/
+/memory/
+/out/
 /hal-out/
 /soft-hci-rebuild/
+
+# Live field captures (locations, journals, hostnames)
+/field-captures/
+
+# Local scratch
+/tmp/

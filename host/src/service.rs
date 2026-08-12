@@ -255,6 +255,16 @@ impl BridgeService {
             }
             request::Op::Disconnect(req) => match self.bluez.disconnect(&req.device_id).await {
                 Ok(()) => {
+                    // Abort all notify streams for this device.
+                    {
+                        let mut tasks = self.notify_tasks.lock().await;
+                        let keys = notify_task_keys_for_device(tasks.keys(), &req.device_id);
+                        for k in keys {
+                            if let Some(h) = tasks.remove(&k) {
+                                h.abort();
+                            }
+                        }
+                    }
                     self.emit(event_envelope(event::Payload::ConnectionState(
                         ConnectionStateEvent {
                             device_id: req.device_id.clone(),
@@ -340,6 +350,11 @@ impl BridgeService {
                         ),
                     )));
                 }
+                // Re-enable must abort any prior stream for this key (insert alone
+                // would drop the JoinHandle without abort → duplicate BlueZ notifies).
+                if let Some(h) = self.notify_tasks.lock().await.remove(&key) {
+                    h.abort();
+                }
                 let svc = if req.service_uuid.is_empty() {
                     None
                 } else {
@@ -354,8 +369,9 @@ impl BridgeService {
                     .await
                 {
                     Ok(stream) => {
-                        // Snapshot guest clients so ATT notify worker receives HVNs
-                        // even if another IPC (scan) also connected around the same time.
+                        // Fan-out to guest clients present at enable time (scan + ATT).
+                        // Soft HCI multi-link workers filter by device_id so peer A
+                        // never applies peer B's notifications.
                         let sinks: Vec<_> =
                             self.event_sinks.lock().await.values().cloned().collect();
                         info!(
@@ -498,6 +514,24 @@ impl BridgeService {
 
 /// Normalize a Bluetooth address to uppercase `AA:BB:CC:DD:EE:FF`.
 /// Accepts lower/mixed case and optional whitespace; rejects empty / wrong shape.
+/// Notify task map keys are `{device_id}:{service}:{char}`. Select keys to abort
+/// when a device disconnects (pure helper — unit tested).
+pub(crate) fn notify_task_keys_for_device<'a>(
+    keys: impl IntoIterator<Item = &'a String>,
+    device_id: &str,
+) -> Vec<String> {
+    let prefix = format!("{device_id}:");
+    let id_upper = device_id.to_ascii_uppercase();
+    keys.into_iter()
+        .filter(|k| {
+            k.starts_with(&prefix)
+                || k.to_ascii_uppercase().starts_with(&format!("{id_upper}:"))
+                || k.eq_ignore_ascii_case(device_id)
+        })
+        .cloned()
+        .collect()
+}
+
 pub(crate) fn normalize_bt_address(raw: &str) -> Option<String> {
     let s = raw.trim().to_uppercase();
     if s.is_empty() {
@@ -542,6 +576,19 @@ mod tests {
         assert!(normalize_bt_address("not-a-mac").is_none());
         assert!(normalize_bt_address("AA:BB:CC:DD:EE").is_none());
         assert!(normalize_bt_address("GG:HH:II:JJ:KK:LL").is_none());
+    }
+
+    #[test]
+    fn notify_task_keys_for_device_selects_prefix_only() {
+        let keys = vec![
+            "AA:BB:CC:DD:EE:01:svc:char".to_string(),
+            "AA:BB:CC:DD:EE:02:svc:char".to_string(),
+            "aa:bb:cc:dd:ee:01:other:x".to_string(),
+            "ZZ:ZZ:ZZ:ZZ:ZZ:ZZ:s:c".to_string(),
+        ];
+        let got = notify_task_keys_for_device(keys.iter(), "AA:BB:CC:DD:EE:01");
+        assert_eq!(got.len(), 2);
+        assert!(got.iter().all(|k| k.to_ascii_uppercase().starts_with("AA:BB:CC:DD:EE:01:")));
     }
 }
 

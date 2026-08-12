@@ -1,0 +1,44 @@
+#!/bin/sh
+# Launch Waydroid full UI with pmOS workarounds (xdg, coldboot, GPS arm).
+set -eu
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+export WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-wayland-0}"
+export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=$XDG_RUNTIME_DIR/bus}"
+export PATH="${HOME}/.local/bin:/usr/bin:/bin:${PATH:-}"
+
+# Waydroid session props expect /run/xdg
+if [ ! -e /run/xdg/wayland-0 ]; then
+  sudo -n mkdir -p /run/xdg 2>/dev/null || true
+  sudo -n mount --bind "$XDG_RUNTIME_DIR" /run/xdg 2>/dev/null || true
+fi
+
+# If a zombie session is half-booted, restart cleanly
+ip=$(waydroid status 2>/dev/null | sed -n "s/^IP address:[[:space:]]*//p" | tr -d "[:space:]")
+st=$(waydroid status 2>/dev/null | sed -n "s/^Session:[[:space:]]*//p" | tr -d "[:space:]")
+if [ "$st" = "RUNNING" ] && [ "$ip" = "UNKNOWN" ]; then
+  echo "Half-booted session detected — restarting..."
+  waydroid session stop 2>/dev/null || true
+  sleep 1
+  sudo -n waydroid container stop 2>/dev/null || true
+  sleep 1
+  sudo -n systemctl start waydroid-container 2>/dev/null || true
+fi
+
+# Force coldboot marker shortly after container appears (ueventd hang workaround)
+(
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+    pid=$(sudo -n lxc-info -P /var/lib/waydroid/lxc -n waydroid -pH 2>/dev/null || true)
+    if [ -n "$pid" ] && [ "$pid" -gt 1 ] 2>/dev/null; then
+      if [ -e "/proc/$pid/root/dev/.booting" ] || [ ! -e "/proc/$pid/root/dev/.coldboot_done" ]; then
+        sudo -n rm -f "/proc/$pid/root/dev/.booting"
+        sudo -n sh -c "echo -n > /proc/$pid/root/dev/.coldboot_done" 2>/dev/null || true
+      fi
+    fi
+    sleep 1
+  done
+) &
+
+# Zero-touch GPS: arm host→guest forwarder (inject waits for boot_completed)
+waydroid-gps-session-hook 2>/dev/null || waydroid-gps-forward enable 2>/dev/null || true
+
+exec waydroid show-full-ui

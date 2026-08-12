@@ -1,0 +1,3 @@
+# GPS forward log sample (golden)
+seed: using last-known lat=...
+inject ok boot_completed=1

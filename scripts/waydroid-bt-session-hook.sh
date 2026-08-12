@@ -8,12 +8,21 @@ INJECT="${INJECT_SCRIPT:-/usr/local/sbin/waydroid-bt-inject-socket.sh}"
 LXC_PATH="${WAYDROID_LXC_PATH:-/var/lib/waydroid/lxc}"
 HOSTDIR="${WAYDROID_BT_HOSTDIR:-/run/waydroid-bt}"
 SOCK="$HOSTDIR/host.sock"
-MAX_WAIT="${WAYDROID_BT_INJECT_WAIT:-90}"
-INJECT_RETRIES="${WAYDROID_BT_INJECT_RETRIES:-5}"
+# Keep short: a timer must not leave multi-minute waiters stacked.
+MAX_WAIT="${WAYDROID_BT_INJECT_WAIT:-15}"
+INJECT_RETRIES="${WAYDROID_BT_INJECT_RETRIES:-3}"
 
 if [ ! -x "$INJECT" ]; then
 	echo "missing $INJECT" >&2
 	exit 1
+fi
+
+# Fast path: container not running → success (nothing to inject). Avoids
+# thrashing every timer tick when Waydroid is stopped.
+PID=$(lxc-info -P "$LXC_PATH" -n waydroid -pH 2>/dev/null || true)
+if [ -z "${PID:-}" ] || [ "$PID" = "-1" ] || ! [ "$PID" -gt 1 ] 2>/dev/null; then
+	echo "SKIP_INJECT: waydroid LXC not running"
+	exit 0
 fi
 
 # Ensure host daemon is at least attempted

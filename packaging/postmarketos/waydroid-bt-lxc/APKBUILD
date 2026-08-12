@@ -1,0 +1,23 @@
+# Contributor: waydroid-bluetooth
+# Maintainer: waydroid-bluetooth
+pkgname=waydroid-bt-lxc
+pkgver=0.1.0
+pkgrel=0
+pkgdesc="LXC mount fragment for waydroid-bt-host socket"
+url="https://github.com/waydroid-bluetooth/waydroid-bluetooth"
+arch="noarch"
+license="MIT"
+depends="waydroid waydroid-bt-host"
+source=""
+options="!check"
+
+package() {
+	install -Dm644 lxc/waydroid-bt-mount.conf \
+		"$pkgdir"/usr/share/waydroid-bt/lxc-mount.conf
+	install -Dm644 lxc/waydroid-bt-mount.conf \
+		"$pkgdir"/etc/waydroid-bt/lxc-mount.conf
+
+	# Install helper that appends the mount entry if missing.
+	install -Dm755 packaging/postmarketos/waydroid-bt-lxc/apply-lxc-mount.sh \
+		"$pkgdir"/usr/bin/waydroid-bt-apply-lxc-mount
+}

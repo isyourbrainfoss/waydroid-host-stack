@@ -43,11 +43,13 @@ struct BluetoothHci : public IBluetoothHci {
 
  private:
   // One Soft ATT + host BlueZ bridge per concurrent LE peer.
+  // ipc is shared_ptr so attNotifyWorker can hold a live copy across att_mu_
+  // unlock without UAF if the session is closed concurrently.
   struct AttSession {
     uint16_t handle = 0;
     std::string peer;  // "AA:BB:..."
     waydroid_bt::SoftAttLink link;
-    std::unique_ptr<waydroid_bt::BridgeIpc> ipc;
+    std::shared_ptr<waydroid_bt::BridgeIpc> ipc;
     std::string device_id;
     std::atomic<bool> notify_run{false};
     std::thread notify_thread;
@@ -70,6 +72,8 @@ struct BluetoothHci : public IBluetoothHci {
   // Disconnection Complete (stack-initiated Disconnect).
   void closeAttSessionLocked(uint16_t handle, bool inject_hci_disconnect);
   void closeAllAttSessionsLocked(bool inject_hci_disconnect);
+  // Join notify workers that were detached from sessions while att_mu_ was held.
+  void drainPendingNotifyJoins();
   uint16_t allocConnHandleLocked();
   AttSession* findSessionByPeerLocked(const std::string& peer);
   AttSession* findSessionByHandleLocked(uint16_t handle);
@@ -112,6 +116,18 @@ struct BluetoothHci : public IBluetoothHci {
   std::map<uint16_t, std::unique_ptr<AttSession>> att_sessions_;
   uint16_t next_conn_handle_{0x0040};
   static constexpr size_t kMaxAttSessions = 8;
+
+  // Post-work for session teardown (must run WITHOUT att_mu_ — see drainPendingNotifyJoins).
+  struct PendingIpcClose {
+    std::shared_ptr<waydroid_bt::BridgeIpc> ipc;
+    std::string device_id;
+    std::thread joiner;
+    bool inject_dc = false;
+    uint16_t handle = 0;
+    std::string peer;
+  };
+  std::mutex pending_join_mu_;
+  std::vector<PendingIpcClose> pending_closes_;
 
   static constexpr const char* kBridgeSocket = "/run/waydroid-bt/host.sock";
   static constexpr const char* kBridgeSocketAlt = "/dev/socket/waydroid_bt";

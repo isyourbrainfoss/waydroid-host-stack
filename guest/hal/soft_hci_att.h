@@ -53,6 +53,11 @@ class SoftAttLink {
   const std::string& peer() const { return peer_; }
   uint8_t peer_type() const { return peer_type_; }
 
+  // Introspection for unit tests / diagnostics (handle Soft ATT table).
+  bool has_cccd_for_char(const std::string& char_uuid) const;
+  uint8_t char_props_for_uuid(const std::string& char_uuid) const;
+  size_t attr_count() const;
+
   // HCI ACL data packet from stack (no packet indicator). May emit ACL replies
   // and HCI Number of Completed Packets via sinks.
   void on_acl_from_stack(const Packet& acl, const std::function<void(const Packet&)>& emit_acl,
@@ -104,5 +109,23 @@ class SoftAttLink {
 std::string normalize_uuid(std::string u);
 bool uuid_is_16(const std::string& u, uint16_t* out);
 Packet uuid_to_bytes_le(const std::string& u);
+
+// Android BluetoothGattCharacteristic property bits (subset).
+constexpr uint8_t kGattPropRead = 0x02;
+constexpr uint8_t kGattPropWriteNr = 0x04;
+constexpr uint8_t kGattPropWrite = 0x08;
+constexpr uint8_t kGattPropNotify = 0x10;
+constexpr uint8_t kGattPropIndicate = 0x20;
+
+// Pure GATT property helpers (unit-tested). Host BlueZ flags win when non-zero.
+// Heuristics apply only when host_properties == 0 (unknown / not reported).
+uint8_t guess_char_properties(const std::string& char_uuid);
+uint8_t resolve_char_properties(uint8_t host_properties, const std::string& char_uuid);
+bool char_needs_cccd(uint8_t properties);
+
+// Multi-link policy: connecting a different peer must not force-close others.
+// Same peer reconnect may reuse; different peer always keeps existing links.
+bool multi_link_preserves_other_peer(const std::string& existing_peer,
+                                     const std::string& connecting_peer);
 
 }  // namespace waydroid_bt

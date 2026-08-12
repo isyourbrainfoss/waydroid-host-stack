@@ -92,6 +92,42 @@ void SoftAttLink::set_host_ops(AttHostOps ops) {
   ops_ = std::move(ops);
 }
 
+uint8_t guess_char_properties(const std::string& char_uuid) {
+  const std::string cu = normalize_uuid(char_uuid);
+  // Common notify streams (only used when host reported properties==0).
+  if (cu.find("873ae82b") != std::string::npos || cu.find("873ae829") != std::string::npos ||
+      cu.find("2a19") != std::string::npos || cu.find("fff4") != std::string::npos ||
+      cu.find("fff1") != std::string::npos || cu.find("fff2") != std::string::npos) {
+    return static_cast<uint8_t>(kGattPropRead | kGattPropNotify);
+  }
+  if (cu.find("873ae82c") != std::string::npos || cu.find("873ae832") != std::string::npos ||
+      cu.find("36f5") != std::string::npos || cu.find("fff3") != std::string::npos) {
+    return static_cast<uint8_t>(kGattPropWrite | kGattPropWriteNr);
+  }
+  return kGattPropRead;
+}
+
+uint8_t resolve_char_properties(uint8_t host_properties, const std::string& char_uuid) {
+  // Host BlueZ flags are authoritative when present. Do not OR in heuristic
+  // notify bits on top of a non-zero host mask (that invented CCCDs for
+  // read-only chars that merely shared a UUID substring).
+  if (host_properties != 0) {
+    return host_properties;
+  }
+  return guess_char_properties(char_uuid);
+}
+
+bool char_needs_cccd(uint8_t properties) {
+  return (properties & (kGattPropNotify | kGattPropIndicate)) != 0;
+}
+
+bool multi_link_preserves_other_peer(const std::string& existing_peer,
+                                     const std::string& connecting_peer) {
+  // Same peer may reconnect/reuse; different peer must leave the other alone.
+  if (existing_peer.empty() || connecting_peer.empty()) return true;
+  return existing_peer != connecting_peer;
+}
+
 void SoftAttLink::build_from_uuids(
     const std::vector<std::pair<std::string, std::vector<CharSpec>>>& services_with_chars) {
   std::lock_guard<std::mutex> lock(mu_);
@@ -114,7 +150,7 @@ void SoftAttLink::build_from_uuids(
     Attr cdecl;
     cdecl.kind = Attr::kCharacteristicDecl;
     cdecl.uuid = "00002803-0000-1000-8000-00805f9b34fb";
-    cdecl.char_props = 0x02;  // read
+    cdecl.char_props = kGattPropRead;
     cdecl.char_uuid = "00002a00-0000-1000-8000-00805f9b34fb";
     cdecl.service_uuid = svc.uuid;
     const size_t cd_idx = attrs_.size();
@@ -124,35 +160,11 @@ void SoftAttLink::build_from_uuids(
     val.uuid = "00002a00-0000-1000-8000-00805f9b34fb";
     val.char_uuid = val.uuid;
     val.service_uuid = svc.uuid;
-    val.static_value.assign({'P', 'R', 'S'});
+    val.static_value.assign({'B', 'T'});
     const uint16_t vh = add(val);
     attrs_[cd_idx].value_handle = vh;
     attrs_[svc_idx].end_group = vh;
   }
-
-  auto guess_props = [](const std::string& cu) -> uint8_t {
-    // Pressensor pressure / log / battery level — notify
-    if (cu.find("873ae82b") != std::string::npos || cu.find("873ae829") != std::string::npos ||
-        cu.find("2a19") != std::string::npos) {
-      return 0x12;  // read | notify
-    }
-    // Pressensor zero / command — write
-    if (cu.find("873ae82c") != std::string::npos || cu.find("873ae832") != std::string::npos) {
-      return 0x0C;  // write | write_nr
-    }
-    // Decent Scale weight stream (fff4) + common write command (36f5 / fff3)
-    // Short form may appear as "...fff4-..." or leading 0000fff4-...
-    if (cu.find("fff4") != std::string::npos) {
-      return 0x10;  // notify (Decent weight)
-    }
-    if (cu.find("36f5") != std::string::npos || cu.find("fff3") != std::string::npos) {
-      return 0x0C;  // write | write_nr
-    }
-    if (cu.find("fff1") != std::string::npos || cu.find("fff2") != std::string::npos) {
-      return 0x12;  // read | notify (some DIY scales)
-    }
-    return 0x02;  // read
-  };
 
   for (const auto& svc_pair : services_with_chars) {
     const std::string su = normalize_uuid(svc_pair.first);
@@ -167,16 +179,7 @@ void SoftAttLink::build_from_uuids(
 
     for (const auto& ch : svc_pair.second) {
       const std::string cu = normalize_uuid(ch.uuid);
-      // Prefer host-reported properties; fall back to UUID heuristics.
-      uint8_t props = ch.properties;
-      if (props == 0) {
-        props = guess_props(cu);
-      }
-      // Ensure notify/indicate chars get CCCD even if host omitted the bit
-      // for known streaming UUIDs (BlueZ flags sometimes incomplete).
-      if (!(props & 0x30) && (guess_props(cu) & 0x10)) {
-        props = static_cast<uint8_t>(props | 0x10);
-      }
+      const uint8_t props = resolve_char_properties(ch.properties, cu);
 
       Attr cdecl;
       cdecl.kind = Attr::kCharacteristicDecl;
@@ -195,8 +198,8 @@ void SoftAttLink::build_from_uuids(
       const uint16_t vh = add(val);
       attrs_[cd_idx].value_handle = vh;
 
-      // notify (0x10) or indicate (0x20) → CCCD so FlutterBluePlus/Decent can subscribe
-      if (props & 0x30) {
+      // notify (0x10) or indicate (0x20) → CCCD
+      if (char_needs_cccd(props)) {
         Attr cccd;
         cccd.kind = Attr::kCccd;
         cccd.uuid = "00002902-0000-1000-8000-00805f9b34fb";
@@ -216,6 +219,31 @@ void SoftAttLink::build_from_uuids(
 bool SoftAttLink::active() const {
   std::lock_guard<std::mutex> lock(mu_);
   return active_;
+}
+
+bool SoftAttLink::has_cccd_for_char(const std::string& char_uuid) const {
+  const std::string n = normalize_uuid(char_uuid);
+  std::lock_guard<std::mutex> lock(mu_);
+  for (const auto& a : attrs_) {
+    if (a.kind == Attr::kCccd && normalize_uuid(a.char_uuid) == n) return true;
+  }
+  return false;
+}
+
+uint8_t SoftAttLink::char_props_for_uuid(const std::string& char_uuid) const {
+  const std::string n = normalize_uuid(char_uuid);
+  std::lock_guard<std::mutex> lock(mu_);
+  for (const auto& a : attrs_) {
+    if (a.kind == Attr::kCharacteristicDecl && normalize_uuid(a.char_uuid) == n) {
+      return a.char_props;
+    }
+  }
+  return 0;
+}
+
+size_t SoftAttLink::attr_count() const {
+  std::lock_guard<std::mutex> lock(mu_);
+  return attrs_.size();
 }
 
 SoftAttLink::Attr* SoftAttLink::find_handle(uint16_t h) {
