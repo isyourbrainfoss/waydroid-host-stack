@@ -130,12 +130,9 @@ step "8/11 socket inject + guest BT probe"
 "$SBINDIR/waydroid-bt-session-hook.sh"
 "$SBINDIR/waydroid-guest-bt-probe.sh" "$LIBEXECDIR/waydroid-bt-guest-probe"
 
-gsh() {
-	timeout 30 lxc-attach -P /var/lib/waydroid/lxc -n waydroid --clear-env \
-		-v PATH=/product/bin:/apex/com.android.runtime/bin:/system/bin:/system/xbin:/vendor/bin \
-		-v ANDROID_ROOT=/system -v ANDROID_DATA=/data -v HOME=/data \
-		-- /system/bin/sh -c "$1" 2>&1
-}
+export WHS_AUTO_THAW=1  # maintenance: thaw if Waydroid suspends mid-run
+# shellcheck source=lib/guest.sh
+. "$ROOT/scripts/lib/guest.sh"
 bt_state() { gsh 'dumpsys bluetooth_manager' | sed -n 's/^ *state: *//p' | head -n1 | tr -d '\r'; }
 PROBLEMS=""
 
@@ -148,6 +145,7 @@ mmcli -m any --location-enable-gps-nmea --location-enable-gps-raw 2>&1 || echo "
 i=0
 while [ ! -s /run/waydroid-host-stack/gps-fix ] && [ "$i" -lt 60 ]; do i=$((i + 2)); sleep 2; done
 echo "host fix: $(cat /run/waydroid-host-stack/gps-fix 2>/dev/null || echo NONE)"
+whs_container_thaw || PROBLEMS="$PROBLEMS container-not-running"
 if "$SBINDIR/waydroid-gps-inject.sh" once; then
 	gsh 'dumpsys location | grep -iE "last location|test provider|gps provider" | head -12' || true
 else
@@ -155,6 +153,7 @@ else
 fi
 
 step "10/11 Android Bluetooth state (toggle once if stuck)"
+whs_container_thaw || true
 st=""
 i=0
 while [ "$i" -lt 30 ]; do

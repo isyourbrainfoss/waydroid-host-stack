@@ -7,7 +7,7 @@
 # container (lxc-attach, no python waydroid CLI) when the fix changed or every
 # $KEEPALIVE s, and sets up providers once per container boot.
 #
-#   waydroid-gps-inject.sh [loop|once|status]
+#   waydroid-gps-inject.sh [loop|once|thaw-once|status]
 set -eu
 
 FIX="${WAYDROID_GPS_FIX:-/run/waydroid-host-stack/gps-fix}"
@@ -20,18 +20,13 @@ mkdir -p "$STATE"
 
 log() { echo "$(date -u +%H:%M:%SZ) $*"; }
 
+# shellcheck source=lib/guest.sh
+. "$(CDPATH='' cd -- "$(dirname "$0")" && pwd)/lib/guest.sh"
+
 container_pid() {
 	pid=$(lxc-info -P "$LXC_PATH" -n waydroid -pH 2>/dev/null || true)
 	case "$pid" in '' | -1 | *[!0-9]*) return 1 ;; esac
 	echo "$pid"
-}
-
-# Run a /system/bin/sh snippet in the guest as root.
-gsh() {
-	lxc-attach -P "$LXC_PATH" -n waydroid --clear-env \
-		-v PATH=/product/bin:/apex/com.android.runtime/bin:/system/bin:/system/xbin:/vendor/bin \
-		-v ANDROID_ROOT=/system -v ANDROID_DATA=/data -v HOME=/data \
-		-- /system/bin/sh -c "$1"
 }
 
 guest_booted() {
@@ -75,6 +70,14 @@ once() {
 		log "host fix stale ($((now - ts))s) — injecting last known anyway"
 	fi
 	pid=$(container_pid) || { rm -f "$STATE/setup-pid"; return 1; }
+	# Frozen = Android suspended by Waydroid; attaching would hang. Retry later.
+	cst=$(whs_container_state)
+	if [ "$cst" != RUNNING ]; then
+		[ "$cst" = "$(cat "$STATE/last-cstate" 2>/dev/null)" ] || log "container $cst — waiting"
+		echo "$cst" >"$STATE/last-cstate"
+		return 1
+	fi
+	echo RUNNING >"$STATE/last-cstate"
 	if [ "$(cat "$STATE/setup-pid" 2>/dev/null)" != "$pid" ]; then
 		guest_booted || return 1
 		setup_providers || { log "provider setup failed"; return 1; }
@@ -97,6 +100,11 @@ loop() {
 	ok_logged=""
 	while :; do
 		cur=$(cut -d'|' -f1-3 "$FIX" 2>/dev/null || true)
+		# Re-inject promptly after a thaw (Android may have missed updates).
+		cst=$(whs_container_state)
+		if [ "$cst" = RUNNING ] && [ "$(cat "$STATE/last-cstate" 2>/dev/null)" != RUNNING ]; then
+			last_t=0
+		fi
 		now=$(date +%s)
 		if [ -n "$cur" ] && { [ "$cur" != "$last" ] || [ $((now - last_t)) -ge "$KEEPALIVE" ]; }; then
 			if once; then
@@ -113,9 +121,10 @@ loop() {
 case "${1:-loop}" in
 loop) loop ;;
 once) once && echo "GPS_INJECT_OK $(cat "$STATE/last")" ;;
+thaw-once) whs_container_thaw; once && echo "GPS_INJECT_OK $(cat "$STATE/last")" ;;
 status)
 	echo "fix: $(cat "$FIX" 2>/dev/null || echo none)"
 	echo "last_inject: $(cat "$STATE/last" 2>/dev/null || echo none) at $(cat "$STATE/last-ts" 2>/dev/null || echo -)"
 	;;
-*) echo "usage: $0 [loop|once|status]" >&2; exit 2 ;;
+*) echo "usage: $0 [loop|once|thaw-once|status]" >&2; exit 2 ;;
 esac

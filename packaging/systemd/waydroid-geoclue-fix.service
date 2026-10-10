@@ -2,14 +2,20 @@
 Description=Mirror GeoClue location to /run/waydroid-host-stack/gps-fix (for Waydroid)
 Documentation=https://github.com/isyourbrainfoss/waydroid-host-stack/blob/main/docs/gps-forward.md
 After=dbus.service geoclue.service ModemManager.service
+# Restart forever while no session agent exists yet (before Phosh login).
+StartLimitIntervalSec=0
 Wants=geoclue.service
 
 [Service]
 Type=simple
+# Run as the Waydroid session user: GeoClue authorizes clients through the
+# user's session agent (Phosh). As root (uid 0, no agent) Start() never replies.
+User=@WAYDROID_USER@
 ExecStart=@BINDIR@/waydroid-geoclue-fix --out /run/waydroid-host-stack/gps-fix
 Restart=always
-RestartSec=10
+RestartSec=15
 RuntimeDirectory=waydroid-host-stack
+RuntimeDirectoryMode=0755
 RuntimeDirectoryPreserve=yes
 NoNewPrivileges=true
 ProtectSystem=strict
