@@ -1,0 +1,11 @@
+[Unit]
+Description=Ensure Waydroid LXC config includes the waydroid-bt socket mount
+Documentation=https://github.com/isyourbrainfoss/waydroid-host-stack/blob/main/docs/pmOS-setup.md
+# Waydroid rewrites lxc/waydroid/config on `waydroid init` / upgrade; this unit
+# re-applies the include line (idempotent). Triggered by the .path unit and by
+# the waydroid-container drop-in.
+ConditionPathExists=/var/lib/waydroid/lxc/waydroid/config
+
+[Service]
+Type=oneshot
+ExecStart=@SBINDIR@/waydroid-bt-apply-lxc-include.sh

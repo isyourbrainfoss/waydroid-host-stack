@@ -1,0 +1,10 @@
+[Unit]
+Description=Bind the Waydroid user's XDG_RUNTIME_DIR to /run/xdg
+Documentation=https://github.com/isyourbrainfoss/waydroid-host-stack/blob/main/docs/pmOS-setup.md
+# Replaces `sudo -n mount --bind ... /run/xdg` in the user GPS/NFC hooks.
+# Started by waydroid-run-xdg.path (root); users never need sudo.
+
+[Service]
+Type=oneshot
+RemainAfterExit=no
+ExecStart=@SBINDIR@/waydroid-run-xdg-bind.sh @WAYDROID_UID@

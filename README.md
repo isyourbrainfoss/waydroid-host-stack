@@ -18,6 +18,15 @@ Android apps get the *capability*. The Linux host keeps the radios: **BlueZ is t
 
 ## Install (on the phone)
 
+Host bridge + root units (needs sudo; image-based hosts such as Nura/Duranium
+are supported — see [docs/duranium.md](docs/duranium.md)):
+
+```sh
+sudo sh scripts/install-host-system.sh   # waydroid-bt-host, LXC include, root units
+```
+
+User-level helpers:
+
 ```sh
 sh scripts/install-waydroid-stack.sh   # GPS + NFC + helpers; Soft HCI host is check-only
 phone-key-ready                        # fail-closed Soft HCI + BlueZ
@@ -26,7 +35,7 @@ phone-idle
 make check                             # desk: forwarder smoke + cargo test
 ```
 
-Docs: [architecture](docs/architecture.md) · [phone-ready](docs/phone-ready.md) · [tesla-day-of](docs/tesla-day-of.md) · [GPS](docs/gps-forward.md) · [NFC](docs/nfc-forward.md) · [pmOS setup](docs/pmOS-setup.md)
+Docs: [architecture](docs/architecture.md) · [phone-ready](docs/phone-ready.md) · [tesla-day-of](docs/tesla-day-of.md) · [GPS](docs/gps-forward.md) · [NFC](docs/nfc-forward.md) · [pmOS setup](docs/pmOS-setup.md) · [Duranium](docs/duranium.md)
 
 ## Layout
 
@@ -38,6 +47,8 @@ Docs: [architecture](docs/architecture.md) · [phone-ready](docs/phone-ready.md)
 | `scripts/` | Forwarders, boot recovery, field pull |
 | `tests/` | Desk selftests + golden Phone Key fixture |
 | `docs/` | Architecture and day-of notes |
+| `devices/` | Per-device config (fajita, enchilada, generic) |
+| `packaging/systemd/` | Root units (LXC include, /run/xdg bind) |
 
 ```bash
 cargo build --release -p waydroid-bt-host

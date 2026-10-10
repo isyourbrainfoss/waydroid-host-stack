@@ -2,9 +2,9 @@
 # Install waydroid-gps-forward for zero-touch use on a Linux phone (pmOS/Phosh).
 set -eu
 
-REPO_SCRIPT="$(CDPATH= cd -- "$(dirname "$0")" && pwd)/waydroid-gps-forward.sh"
+REPO_SCRIPT="$(CDPATH='' cd -- "$(dirname "$0")" && pwd)/waydroid-gps-forward.sh"
 DEST="${HOME}/.local/bin/waydroid-gps-forward"
-DESKTOP_SRC="$(CDPATH= cd -- "$(dirname "$0")" && pwd)/waydroid-gps-forward.desktop"
+DESKTOP_SRC="$(CDPATH='' cd -- "$(dirname "$0")" && pwd)/waydroid-gps-forward.desktop"
 DESKTOP_DEST="${HOME}/.local/share/applications/waydroid-gps-forward.desktop"
 HOOK_DEST="${HOME}/.local/bin/waydroid-gps-session-hook"
 START_UI="${HOME}/.local/bin/waydroid-start-ui"
@@ -27,9 +27,10 @@ export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=$XDG_RUNTIME_DIR/bus}"
 export WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-wayland-0}"
 # /run/xdg for Waydroid session props
+# /run/xdg is bound by the root unit waydroid-run-xdg.path/.service
+# (installed by install-host-system.sh). No sudo from user hooks.
 if [ ! -e /run/xdg/wayland-0 ] && [ -S "$XDG_RUNTIME_DIR/wayland-0" ]; then
-  sudo -n mkdir -p /run/xdg 2>/dev/null || true
-  sudo -n mount --bind "$XDG_RUNTIME_DIR" /run/xdg 2>/dev/null || true
+  systemctl start --no-ask-password waydroid-run-xdg.service 2>/dev/null || true
 fi
 if command -v waydroid-gps-forward >/dev/null 2>&1; then
   waydroid-gps-forward enable >/dev/null 2>&1 || waydroid-gps-forward start >/dev/null 2>&1 || true

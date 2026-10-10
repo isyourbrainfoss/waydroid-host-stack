@@ -542,7 +542,7 @@ stop_mock_if_running() {
 self_path() {
   case "$0" in
     /*) echo "$0" ;;
-    *) echo "$(CDPATH= cd -- "$(dirname "$0")" 2>/dev/null && pwd)/$(basename "$0")" ;;
+    *) echo "$(CDPATH='' cd -- "$(dirname "$0")" 2>/dev/null && pwd)/$(basename "$0")" ;;
   esac
 }
 

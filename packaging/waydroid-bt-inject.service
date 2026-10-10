@@ -1,15 +1,13 @@
 [Unit]
-Description=Inject waydroid-bt host socket into Waydroid LXC
-Documentation=file:///usr/share/doc/waydroid-bluetooth/pmOS-setup.md
+Description=Inject waydroid-bt host socket into Waydroid LXC (runtime fallback)
+Documentation=https://github.com/isyourbrainfoss/waydroid-host-stack/blob/main/docs/pmOS-setup.md
 After=waydroid-container.service waydroid-bt-host.service
 Wants=waydroid-bt-host.service
 
 [Service]
 Type=oneshot
-# Poll until LXC is up after a user starts a Waydroid session, then inject.
-# Started by path/timer or manually: systemctl start waydroid-bt-inject.service
-ExecStart=/usr/local/sbin/waydroid-bt-session-hook.sh
+# Primary path is the lxc.include mount (waydroid-bt-lxc-include.service).
+# This oneshot (timer-driven, root) re-binds only if the guest lost the socket.
+# Installers rewrite @SBINDIR@.
+ExecStart=@SBINDIR@/waydroid-bt-session-hook.sh
 RemainAfterExit=no
-
-[Install]
-WantedBy=multi-user.target

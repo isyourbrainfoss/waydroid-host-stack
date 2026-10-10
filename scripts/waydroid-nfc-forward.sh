@@ -581,7 +581,7 @@ fail_streak_set() {
 self_path() {
   case "$0" in
     /*) echo "$0" ;;
-    *) echo "$(CDPATH= cd -- "$(dirname "$0")" 2>/dev/null && pwd)/$(basename "$0")" ;;
+    *) echo "$(CDPATH='' cd -- "$(dirname "$0")" 2>/dev/null && pwd)/$(basename "$0")" ;;
   esac
 }
 
@@ -809,6 +809,19 @@ once() {
 # Optional: install host NFC userspace packages (pmOS/Alpine). Needs root network.
 install_host_stack() {
   echo "Installing optional host NFC stack (neard + libnfc-tools)…"
+  if command -v neard >/dev/null 2>&1 || [ -x /usr/libexec/nfc/neard ] || [ -x /usr/lib/neard/neard ]; then
+    echo "neard already present"
+    ensure_neard_running || true
+    echo "host_nfc_userspace: $(host_nfc_userspace_summary)"
+    return 0
+  fi
+  # Image-based hosts (read-only /usr, apk database empty): packages cannot be
+  # added; neard must come from the OS image or a sysext.
+  if [ -r /etc/os-release ] && grep -q '^IMAGE_ID=' /etc/os-release; then
+    echo "neard missing and this is an image-based OS ($(sed -n 's/^IMAGE_ID=//p' /etc/os-release)); cannot apk add." >&2
+    echo "NFC forward still works via push/fixture/last-tag; live tags need neard from the image or a sysext." >&2
+    return 1
+  fi
   APK=""
   for c in apk /usr/sbin/apk /sbin/apk; do
     if command -v "$c" >/dev/null 2>&1 || [ -x "$c" ]; then

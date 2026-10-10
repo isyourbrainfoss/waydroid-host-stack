@@ -2,7 +2,7 @@
 # Offline golden: pull-field-session --local on Phone Key fixture must surface
 # whitelist → unlocked timeline (desk proof of field evidence loop).
 set -eu
-ROOT="$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)"
+ROOT="$(CDPATH='' cd -- "$(dirname "$0")/.." && pwd)"
 FIX="$ROOT/tests/fixtures/phone-key-golden"
 SCRIPT="$ROOT/scripts/pull-field-session.sh"
 fail=0

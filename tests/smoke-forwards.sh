@@ -1,7 +1,7 @@
 #!/bin/sh
 # Host-side smoke: pure selftests for GPS + NFC forwarders (no phone required).
 set -eu
-ROOT="$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)"
+ROOT="$(CDPATH='' cd -- "$(dirname "$0")/.." && pwd)"
 fail=0
 echo "=== gps-forward selftest ==="
 if ! sh "$ROOT/tests/gps-forward-selftest.sh"; then

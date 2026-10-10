@@ -13,6 +13,10 @@ path = "src/main.rs"
 name = "waydroid-bt-ping"
 path = "src/bin/waydroid-bt-ping.rs"
 
+[[bin]]
+name = "waydroid-bt-jni-patch"
+path = "src/bin/waydroid-bt-jni-patch.rs"
+
 [dependencies]
 waydroid_bt_protocol = { workspace = true }
 anyhow = { workspace = true }
@@ -28,6 +32,13 @@ bluer = { version = "0.17", features = ["bluetoothd"] }
 futures = "0.3"
 clap = { version = "4", features = ["derive", "env"] }
 tokio-util = { version = "0.7", features = ["codec"] }
+# Only pulled in to switch libdbus-sys to a vendored (static) build for
+# cross/static aarch64 musl binaries: `--features vendored-dbus`.
+dbus = { version = "0.9", optional = true }
+
+[features]
+default = []
+vendored-dbus = ["dep:dbus", "dbus/vendored"]
 
 [dev-dependencies]
 tempfile = "3"

@@ -1,7 +1,7 @@
 #!/bin/sh
 # Install BT Log Session launcher into Phosh app drawer (user-local).
 set -eu
-ROOT=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
+ROOT=$(CDPATH='' cd -- "$(dirname "$0")/.." && pwd)
 BIN_DIR="${HOME}/.local/bin"
 APP_DIR="${HOME}/.local/share/applications"
 

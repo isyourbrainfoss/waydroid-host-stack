@@ -1,0 +1,9 @@
+[Unit]
+Description=Bind /run/xdg once the Waydroid user's Wayland socket appears
+
+[Path]
+PathExists=/run/user/@WAYDROID_UID@/wayland-0
+Unit=waydroid-run-xdg.service
+
+[Install]
+WantedBy=multi-user.target
