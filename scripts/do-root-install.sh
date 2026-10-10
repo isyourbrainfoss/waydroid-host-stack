@@ -165,6 +165,23 @@ fi
 step "10/11 Android Bluetooth: grant runtime perms, then toggle once if stuck"
 whs_container_thaw || true
 sh "$ROOT/scripts/waydroid-bt-grant-perms.sh" || PROBLEMS="$PROBLEMS bt-perms"
+# The Bluetooth process that booted without BLUETOOTH_CONNECT stays wedged in
+# BLE_TURNING_ON (USER_TURN_OFF/ON are "Unhandled" there), and granting does not
+# restart it. Kill it once; BluetoothManagerService rebinds and re-enables with
+# the new grants.
+if [ "$(bt_state)" != ON ]; then
+	old=$(gsh 'pidof com.android.bluetooth' | tr -d '\r\n')
+	echo "restarting com.android.bluetooth (pid ${old:-none}) to pick up grants"
+	[ -n "$old" ] && gsh "kill -9 $old" || true
+	i=0
+	while [ "$i" -lt 30 ]; do
+		new=$(gsh 'pidof com.android.bluetooth' | tr -d '\r\n')
+		[ -n "$new" ] && [ "$new" != "$old" ] && break
+		i=$((i + 2)); sleep 2
+	done
+	echo "com.android.bluetooth new pid=${new:-none} after ${i}s"
+	gsh 'cmd bluetooth_manager enable' || true
+fi
 st=""
 i=0
 while [ "$i" -lt 30 ]; do
