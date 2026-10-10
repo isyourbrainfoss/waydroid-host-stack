@@ -4,12 +4,13 @@
 # "Duranium", other systemd-sysext images) where /usr is read-only.
 #
 # Installs:
-#   $BINDIR      waydroid-bt-host, waydroid-bt-ping, waydroid-bt-jni-patch
+#   $BINDIR      waydroid-bt-host, waydroid-bt-ping, waydroid-bt-jni-patch, waydroid-geoclue-fix
 #   $LIBEXECDIR  waydroid-bt-guest-probe
 #   $SBINDIR     root helpers (+ $SBINDIR/lib/*.sh)
 #   $UNITDIR     waydroid-bt-host.service, waydroid-bt-inject.{service,timer},
 #                waydroid-bt-lxc-include.{service,path},
 #                waydroid-run-xdg.{service,path},
+#                waydroid-geoclue-fix.service, waydroid-gps-inject.service,
 #                waydroid-container.service.d/50-waydroid-bt.conf
 #   $SYSCONFDIR  lxc-mount.conf (+ device.conf)
 #
@@ -102,6 +103,7 @@ subst() {
 	fi
 	sed -e "s|@SBINDIR@|$SBINDIR|g" \
 		-e "s|@WAYDROID_UID@|$(waydroid_uid)|g" \
+		-e "s|@BINDIR@|$BINDIR|g" \
 		-e "s|/usr/bin/waydroid-bt-host|$BINDIR/waydroid-bt-host|g" \
 		"$1" >"$2"
 	chmod 0644 "$2"
@@ -109,18 +111,20 @@ subst() {
 
 UNITS="waydroid-bt-host.service waydroid-bt-inject.service waydroid-bt-inject.timer
 waydroid-bt-lxc-include.service waydroid-bt-lxc-include.path
-waydroid-run-xdg.service waydroid-run-xdg.path"
+waydroid-run-xdg.service waydroid-run-xdg.path
+waydroid-geoclue-fix.service waydroid-gps-inject.service"
 SBIN_SCRIPTS="waydroid-bt-inject-socket.sh waydroid-bt-session-hook.sh
 waydroid-guest-bt-probe.sh waydroid-bt-apply-lxc-include.sh waydroid-run-xdg-bind.sh
 waydroid-bt-stabilize-adapter.sh waydroid-restore-bluetooth-apk.sh
-waydroid-patch-bt-jni-timerfd.py waydroid-install-soft-hci-hal.sh"
+waydroid-patch-bt-jni-timerfd.py waydroid-install-soft-hci-hal.sh
+waydroid-gps-inject.sh waydroid-bt-diag.sh"
 
 stage() {
 	D="$DESTDIR"
 	echo "=== stage host files (DESTDIR=${D:-/}) ==="
 	whs_print_paths
 
-	for b in waydroid-bt-host waydroid-bt-ping waydroid-bt-jni-patch; do
+	for b in waydroid-bt-host waydroid-bt-ping waydroid-bt-jni-patch waydroid-geoclue-fix; do
 		if src=$(find_bin "$b"); then
 			run install -Dm0755 "$src" "$D$BINDIR/$b"
 		elif [ "$b" = waydroid-bt-host ]; then
@@ -154,7 +158,8 @@ stage() {
 	subst "$ROOT/packaging/waydroid-bt-inject.service" "$D$UNITDIR/waydroid-bt-inject.service"
 	subst "$ROOT/packaging/waydroid-bt-inject.timer" "$D$UNITDIR/waydroid-bt-inject.timer"
 	for u in waydroid-bt-lxc-include.service waydroid-bt-lxc-include.path \
-		waydroid-run-xdg.service waydroid-run-xdg.path; do
+		waydroid-run-xdg.service waydroid-run-xdg.path \
+		waydroid-geoclue-fix.service waydroid-gps-inject.service; do
 		subst "$ROOT/packaging/systemd/$u" "$D$UNITDIR/$u"
 	done
 	subst "$ROOT/packaging/systemd/waydroid-container.service.d/50-waydroid-bt.conf" \
@@ -164,6 +169,8 @@ stage() {
 stage_etc() {
 	D="$DESTDIR"
 	run install -Dm0644 "$ROOT/lxc/waydroid-bt-mount.conf" "$D$SYSCONFDIR/lxc-mount.conf"
+	run install -Dm0644 "$ROOT/packaging/geoclue/90-waydroid-host-stack.conf" \
+		"$D/etc/geoclue/conf.d/90-waydroid-host-stack.conf"
 	if [ -n "${WHS_DEVICE_CONF:-}" ]; then
 		run install -Dm0644 "$WHS_DEVICE_CONF" "$D$SYSCONFDIR/device.conf"
 	fi
@@ -186,19 +193,23 @@ activate() {
 	run systemctl daemon-reload
 	run systemctl enable --now waydroid-bt-host.service
 	run systemctl enable --now waydroid-bt-lxc-include.path waydroid-run-xdg.path waydroid-bt-inject.timer
+	# GeoClue re-reads conf.d only on restart (it is D-Bus activated; cheap).
+	run systemctl try-restart geoclue.service || true
+	run systemctl enable waydroid-geoclue-fix.service waydroid-gps-inject.service
+	run systemctl restart waydroid-geoclue-fix.service waydroid-gps-inject.service
 	run "$SBINDIR/waydroid-bt-apply-lxc-include.sh" || true
 	echo "Restart Waydroid to pick up the LXC mount:"
 	echo "  waydroid session stop; sudo systemctl restart waydroid-container; waydroid session start"
 }
 
 uninstall() {
-	for u in waydroid-bt-inject.timer waydroid-run-xdg.path waydroid-bt-lxc-include.path waydroid-bt-host.service; do
+	for u in waydroid-gps-inject.service waydroid-geoclue-fix.service waydroid-bt-inject.timer waydroid-run-xdg.path waydroid-bt-lxc-include.path waydroid-bt-host.service; do
 		run systemctl disable --now "$u" 2>/dev/null || true
 	done
 	for u in $UNITS; do run rm -f "$UNITDIR/$u"; done
 	run rm -f "$UNITDIR/waydroid-container.service.d/50-waydroid-bt.conf"
 	run rmdir "$UNITDIR/waydroid-container.service.d" 2>/dev/null || true
-	for b in waydroid-bt-host waydroid-bt-ping waydroid-bt-jni-patch; do run rm -f "$BINDIR/$b"; done
+	for b in waydroid-bt-host waydroid-bt-ping waydroid-bt-jni-patch waydroid-geoclue-fix; do run rm -f "$BINDIR/$b"; done
 	run rm -f "$LIBEXECDIR/waydroid-bt-guest-probe"
 	for s in $SBIN_SCRIPTS; do run rm -f "$SBINDIR/$s"; done
 	run rm -rf "$SBINDIR/lib" "$SBINDIR/guest-hal"
@@ -214,6 +225,7 @@ uninstall() {
 		fi
 	fi
 	run rm -rf "$SYSCONFDIR"
+	run rm -f /etc/geoclue/conf.d/90-waydroid-host-stack.conf
 	run systemctl daemon-reload
 	echo "UNINSTALL_OK"
 }

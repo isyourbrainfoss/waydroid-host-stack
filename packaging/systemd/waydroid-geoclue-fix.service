@@ -1,0 +1,22 @@
+[Unit]
+Description=Mirror GeoClue location to /run/waydroid-host-stack/gps-fix (for Waydroid)
+Documentation=https://github.com/isyourbrainfoss/waydroid-host-stack/blob/main/docs/gps-forward.md
+After=dbus.service geoclue.service ModemManager.service
+Wants=geoclue.service
+
+[Service]
+Type=simple
+ExecStart=@BINDIR@/waydroid-geoclue-fix --out /run/waydroid-host-stack/gps-fix
+Restart=always
+RestartSec=10
+RuntimeDirectory=waydroid-host-stack
+RuntimeDirectoryPreserve=yes
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/run/waydroid-host-stack
+RestrictAddressFamilies=AF_UNIX
+
+[Install]
+WantedBy=multi-user.target

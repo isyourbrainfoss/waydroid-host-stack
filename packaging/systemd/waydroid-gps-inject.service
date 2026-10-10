@@ -1,0 +1,17 @@
+[Unit]
+Description=Inject host location into Waydroid test providers (root, lxc-attach)
+Documentation=https://github.com/isyourbrainfoss/waydroid-host-stack/blob/main/docs/gps-forward.md
+After=waydroid-container.service waydroid-geoclue-fix.service
+Wants=waydroid-geoclue-fix.service
+
+[Service]
+Type=simple
+ExecStart=@SBINDIR@/waydroid-gps-inject.sh loop
+Restart=always
+RestartSec=5
+RuntimeDirectory=waydroid-host-stack
+RuntimeDirectoryPreserve=yes
+Nice=10
+
+[Install]
+WantedBy=multi-user.target
