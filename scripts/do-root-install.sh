@@ -4,6 +4,7 @@
 #
 #   sudo sh scripts/do-root-install.sh [ARTIFACTS_DIR]   full install + checks
 #   sudo sh scripts/do-root-install.sh --diag            diagnostics only
+#   sudo sh scripts/do-root-install.sh --fix-bt          BT perms + toggle + diag (Waydroid running)
 #
 # Always ends with a guest diagnostic dump (~<user>/waydroid-bt-diag-*.txt) and
 # a final DO_ROOT_INSTALL_OK or DO_ROOT_INSTALL_FAILED line.
@@ -20,10 +21,10 @@ set -eu
 
 ROOT=$(CDPATH='' cd -- "$(dirname "$0")/.." && pwd)
 MODE=install
-if [ "${1:-}" = "--diag" ]; then
-	MODE=diag
-	shift
-fi
+case "${1:-}" in
+--diag) MODE=diag; shift ;;
+--fix-bt) MODE=fixbt; shift ;;
+esac
 ART="${1:-$ROOT/artifacts}"
 U="${SUDO_USER:-${DOAS_USER:-kb}}"
 UHOME=$(getent passwd "$U" | cut -d: -f6)
@@ -44,7 +45,7 @@ if [ -z "${WHS_LOGGING:-}" ]; then
 	tee -a "$LOG" <"$fifo" &
 	teepid=$!
 	set +e
-	if [ "$MODE" = diag ]; then set -- --diag "$@"; fi
+	if [ "$MODE" != install ]; then set -- "--$( [ "$MODE" = fixbt ] && echo fix-bt || echo diag)" "$@"; fi
 	sh "$0" "$@" >"$fifo" 2>&1
 	rc=$?
 	wait "$teepid"
@@ -74,6 +75,7 @@ if [ "$MODE" = diag ]; then
 	exit 0
 fi
 
+if [ "$MODE" = install ]; then
 step "1/11 preflight + checksums"
 for f in bin/waydroid-bt-host bin/waydroid-bt-jni-patch bin/waydroid-bt-guest-probe bin/waydroid-geoclue-fix \
 	android/Bluetooth.apk android/libbluetooth_jni.so \
@@ -130,12 +132,19 @@ step "8/11 socket inject + guest BT probe"
 "$SBINDIR/waydroid-bt-session-hook.sh"
 "$SBINDIR/waydroid-guest-bt-probe.sh" "$LIBEXECDIR/waydroid-bt-guest-probe"
 
+fi
+
 export WHS_AUTO_THAW=1  # maintenance: thaw if Waydroid suspends mid-run
 # shellcheck source=lib/guest.sh
 . "$ROOT/scripts/lib/guest.sh"
 bt_state() { gsh 'dumpsys bluetooth_manager' | sed -n 's/^ *state: *//p' | head -n1 | tr -d '\r'; }
 PROBLEMS=""
+if [ "$MODE" = fixbt ]; then
+	step "fix-bt: Waydroid must already be running"
+	whs_container_thaw || { echo "container not running — start Waydroid first"; exit 1; }
+fi
 
+if [ "$MODE" != fixbt ]; then
 step "9/11 location: root GeoClue reader + injector (replaces sudo -n user loop)"
 # The user loop idles itself when the root injector is active; also stop it now.
 as_user systemctl --user disable --now waydroid-gps-forward.service 2>/dev/null || true
@@ -152,8 +161,10 @@ else
 	PROBLEMS="$PROBLEMS gps-inject-failed"
 fi
 
-step "10/11 Android Bluetooth state (toggle once if stuck)"
+fi
+step "10/11 Android Bluetooth: grant runtime perms, then toggle once if stuck"
 whs_container_thaw || true
+sh "$ROOT/scripts/waydroid-bt-grant-perms.sh" || PROBLEMS="$PROBLEMS bt-perms"
 st=""
 i=0
 while [ "$i" -lt 30 ]; do

@@ -69,6 +69,7 @@ bt_state() {
 		g 'ls -la /apex/com.android.btservices/app/*/ /apex/com.android.btservices/lib64/libbluetooth_jni.so; pm path com.android.bluetooth'
 		g 'getprop ro.bluetooth.ble_start_timeout_delay; grep -n ble_ /system/build.prop'
 		g 'dumpsys bluetooth_manager | head -60'
+		g 'dumpsys package com.android.bluetooth | grep -E "userId=|sharedUser|signatures|pkgFlags|privateFlags|granted=false|BLUETOOTH" | head -40'
 		g 'ls -la /data/misc/bluetooth /data/misc/bluetooth/logs /data/tombstones 2>&1 | head -40'
 		g 'logcat -d -b crash | tail -80'
 		g 'logcat -d -b all -v threadtime | grep -iE "bt_hci_waydroid|Soft HCI|bluetooth|bt_stack|bt_btif|bt_hci|hci_hal|HidlServiceManagement|hwservicemanager|vintf|BluetoothManager|AdapterState|AdapterService|avc:" | tail -400'
