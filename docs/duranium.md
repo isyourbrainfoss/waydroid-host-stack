@@ -73,3 +73,24 @@ Both refuse to run unless `system.img` reports SDK 33 / build id `TQ3A*`.
 `nfc0` (nxp_nci_i2c) exists, but neard is not in the image and cannot be
 apk-installed. The NFC installer reports this and keeps push/fixture/last-tag
 delivery; live tags need neard from the image or a sysext.
+
+## Location (root path, no sudo -n)
+
+`install-host-system.sh` installs two root units that replace the user-level
+`waydroid-gps-forward` loop's `sudo -n waydroid shell` calls (and its python3
+GeoClue reader, which image-based hosts lack):
+
+- `waydroid-geoclue-fix.service` — `waydroid-geoclue-fix` keeps a GeoClue2 client
+  (DesktopId `waydroid-gps-forward`, allowed via
+  `/etc/geoclue/conf.d/90-waydroid-host-stack.conf`) and writes every update to
+  `/run/waydroid-host-stack/gps-fix`. GeoClue picks GNSS from ModemManager when
+  available (works without a SIM on OnePlus 6 once
+  `mmcli -m any --location-enable-gps-nmea` is set), else WiFi/IP via BeaconDB.
+- `waydroid-gps-inject.service` — `waydroid-gps-inject.sh loop` injects that fix
+  into the guest's `gps`/`network` test providers via `lxc-attach` only when it
+  changes (keepalive 30 s); no python `waydroid` CLI per tick.
+
+The user loop idles automatically while the root injector is active.
+
+Diagnostics: `sudo sh scripts/do-root-install.sh --diag` writes
+`~/waydroid-bt-diag-<UTC>.txt` (+ `.logcat.gz`).

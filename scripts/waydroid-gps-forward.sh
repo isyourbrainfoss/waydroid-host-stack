@@ -310,7 +310,24 @@ pick_fix_from_line() {
 
 # --- host location sources --------------------------------------------------
 
+# Root path (preferred): waydroid-geoclue-fix.service mirrors GeoClue into
+# this file and waydroid-gps-inject.service injects it (no sudo, no python3).
+ROOT_FIX="${WAYDROID_GPS_FIX:-/run/waydroid-host-stack/gps-fix}"
+
+root_inject_active() {
+  systemctl is-active --quiet waydroid-gps-inject.service 2>/dev/null
+}
+
 read_geoclue() {
+  if [ -s "$ROOT_FIX" ]; then
+    IFS='|' read -r _lat _lon _acc _alt _spd _hdg _ts _desc <"$ROOT_FIX" || true
+    _now=$(date +%s)
+    if [ -n "${_lat:-}" ] && [ -n "${_lon:-}" ] && [ $((_now - ${_ts:-0})) -le 120 ]; then
+      echo "${_lat}|${_lon}|${_acc:-50}|${_alt:-}|${_spd:-}|${_hdg:-}|geoclue"
+      return 0
+    fi
+  fi
+  command -v python3 >/dev/null 2>&1 || return 0
   python3 - <<'PY' 2>/dev/null || true
 import sys
 try:
@@ -560,6 +577,10 @@ export XDG_STATE_HOME="${XDG_STATE_HOME:-}"
 export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-}"
 export WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-}"
 while true; do
+  if systemctl is-active --quiet waydroid-gps-inject.service 2>/dev/null; then
+    sleep 300   # root injector owns Waydroid location; stay idle
+    continue
+  fi
   "$self" once || true
   sleep $INTERVAL
 done
@@ -598,6 +619,11 @@ EOF
 
 start() {
   mkdir -p "$STATE_ROOT" "$RUNTIME"
+  if root_inject_active; then
+    echo "root waydroid-gps-inject.service is active — user loop not needed; disabling $UNIT_NAME"
+    systemctl --user disable --now "$UNIT_NAME" 2>/dev/null || true
+    return 0
+  fi
   seed_last_known_if_missing
   stop_mock_if_running
   : >>"$LOGFILE"
@@ -741,6 +767,10 @@ log_inject_ok() {
 }
 
 once() {
+  if root_inject_active; then
+    log_rate root_active "$LOG_IDLE_S" "once: root waydroid-gps-inject.service active — user loop idle"
+    return 0
+  fi
   seed_last_known_if_missing
 
   # Always refresh last-known from host when possible (even if guest down).
