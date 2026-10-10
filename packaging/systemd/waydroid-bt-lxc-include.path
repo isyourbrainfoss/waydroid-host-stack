@@ -1,0 +1,9 @@
+[Unit]
+Description=Re-apply waydroid-bt LXC include when Waydroid regenerates its config
+
+[Path]
+PathChanged=/var/lib/waydroid/lxc/waydroid/config
+Unit=waydroid-bt-lxc-include.service
+
+[Install]
+WantedBy=multi-user.target

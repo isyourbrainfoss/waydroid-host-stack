@@ -16,7 +16,7 @@ for arg in "$@"; do
   esac
 done
 
-REPO_SCRIPT="$(CDPATH= cd -- "$(dirname "$0")" && pwd)/waydroid-nfc-forward.sh"
+REPO_SCRIPT="$(CDPATH='' cd -- "$(dirname "$0")" && pwd)/waydroid-nfc-forward.sh"
 DEST="${HOME}/.local/bin/waydroid-nfc-forward"
 HOOK_DEST="${HOME}/.local/bin/waydroid-nfc-session-hook"
 START_UI="${HOME}/.local/bin/waydroid-start-ui"
@@ -36,9 +36,10 @@ export PATH="${HOME}/.local/bin:/usr/bin:/bin:${PATH:-}"
 export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=$XDG_RUNTIME_DIR/bus}"
 export WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-wayland-0}"
+# /run/xdg is bound by the root unit waydroid-run-xdg.path/.service
+# (installed by install-host-system.sh). No sudo from user hooks.
 if [ ! -e /run/xdg/wayland-0 ] && [ -S "$XDG_RUNTIME_DIR/wayland-0" ]; then
-  sudo -n mkdir -p /run/xdg 2>/dev/null || true
-  sudo -n mount --bind "$XDG_RUNTIME_DIR" /run/xdg 2>/dev/null || true
+  systemctl start --no-ask-password waydroid-run-xdg.service 2>/dev/null || true
 fi
 if command -v waydroid-nfc-forward >/dev/null 2>&1; then
   waydroid-nfc-forward enable >/dev/null 2>&1 || waydroid-nfc-forward start >/dev/null 2>&1 || true
@@ -103,6 +104,25 @@ fi
 export PATH="${HOME}/.local/bin:${PATH}"
 export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 "$DEST" enable
+
+# Detect host NFC userspace up front (live tags need neard).
+NEARD=""
+for c in neard /usr/libexec/nfc/neard /usr/lib/neard/neard /usr/sbin/neard; do
+  if command -v "$c" >/dev/null 2>&1 || [ -x "$c" ]; then NEARD="$c"; break; fi
+done
+if [ -e /sys/class/nfc/nfc0 ]; then NFC_DEV=nfc0; else NFC_DEV=none; fi
+if [ -z "$NEARD" ]; then
+  echo "NOTE: neard not found (kernel NFC device: $NFC_DEV)."
+  echo "  Live tag reading is disabled; push/fixture/last-tag delivery still works."
+  if [ -r /etc/os-release ] && grep -q '^IMAGE_ID=' /etc/os-release; then
+    echo "  Image-based OS: neard must be provided by the OS image or a sysext (apk add is not possible)."
+    WITH_HOST_STACK=0
+  else
+    echo "  Re-run with --with-host-stack to try installing neard + libnfc-tools."
+  fi
+else
+  echo "neard: $NEARD (kernel NFC device: $NFC_DEV)"
+fi
 
 if [ "$WITH_HOST_STACK" = "1" ]; then
   "$DEST" install-host-stack || echo "host stack install skipped/failed (live field optional)"

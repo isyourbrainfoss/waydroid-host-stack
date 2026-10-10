@@ -1,28 +1,35 @@
 [Unit]
 Description=Waydroid Bluetooth host bridge (BlueZ client)
-Documentation=https://github.com/waydroid-bluetooth/waydroid-bluetooth
+Documentation=https://github.com/isyourbrainfoss/waydroid-host-stack/blob/main/docs/pmOS-setup.md
 After=bluetooth.service
 Wants=bluetooth.service
 
 [Service]
 Type=simple
+# Installers rewrite this path to $BINDIR (image-based default:
+# /var/lib/waydroid-host-stack/bin). Distro packages / sysext keep /usr/bin.
 ExecStart=/usr/bin/waydroid-bt-host --socket /run/waydroid-bt/host.sock
 Restart=on-failure
 RestartSec=2
-# RuntimeDirectory creates /run/waydroid-bt owned by the service user
+# /run/waydroid-bt is bind-mounted into the Waydroid container. Keep the
+# directory (same inode) across daemon restarts, otherwise the guest's bind
+# mount points at a deleted directory until the container restarts.
 RuntimeDirectory=waydroid-bt
 RuntimeDirectoryMode=0755
-# Needs D-Bus system bus access to org.bluez
-BusName=
+RuntimeDirectoryPreserve=yes
 
-# Hardening (keep D-Bus and Bluetooth usable)
+# Hardening. The daemon only talks to org.bluez over the D-Bus system bus
+# (bluer, "bluetoothd" feature) and serves a Unix socket: it opens no raw
+# HCI/L2CAP (AF_BLUETOOTH) or netlink sockets, so AF_UNIX is sufficient.
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
 ReadWritePaths=/run/waydroid-bt
-# BlueZ / D-Bus
-RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_BLUETOOTH
+RestrictAddressFamilies=AF_UNIX
 
 [Install]
 WantedBy=multi-user.target

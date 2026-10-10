@@ -1,7 +1,7 @@
 #!/bin/sh
 # Structural + offline tests for pull-field-session (no live SSH required).
 set -eu
-ROOT="$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)"
+ROOT="$(CDPATH='' cd -- "$(dirname "$0")/.." && pwd)"
 SCRIPT="$ROOT/scripts/pull-field-session.sh"
 fail=0
 

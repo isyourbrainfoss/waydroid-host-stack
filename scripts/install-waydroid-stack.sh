@@ -8,7 +8,7 @@
 #   sh scripts/install-waydroid-stack.sh --dry-run
 set -eu
 
-ROOT="$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)"
+ROOT="$(CDPATH='' cd -- "$(dirname "$0")/.." && pwd)"
 DRY=0
 NFC_HOST=0
 for a in "$@"; do
@@ -70,7 +70,16 @@ for s in phone-field-ready.sh phone-idle.sh pull-field-session.sh \
 done
 
 echo "--- Force normal boot overlay (charger cmdline fix) ---"
-if [ -f "$ROOT/scripts/waydroid-force-normal-boot.sh" ]; then
+# shellcheck source=scripts/lib/device.sh
+. "$ROOT/scripts/lib/device.sh"
+whs_load_device "$ROOT"
+echo "device: $WHS_DEVICE ($DEVICE_NAME)"
+if grep -q 'androidboot.mode=charger' /proc/cmdline 2>/dev/null; then
+  HALF_BOOT_FIX=1
+fi
+if [ "${HALF_BOOT_FIX:-0}" != "1" ]; then
+  echo "skip: device config HALF_BOOT_FIX=0 and no androidboot.mode=charger in /proc/cmdline"
+elif [ -f "$ROOT/scripts/waydroid-force-normal-boot.sh" ]; then
   run sh "$ROOT/scripts/waydroid-force-normal-boot.sh" install || true
 else
   echo "waydroid-force-normal-boot: script missing"
@@ -79,11 +88,12 @@ fi
 echo "--- Soft HCI host (check only) ---"
 if command -v waydroid-bt-host >/dev/null 2>&1; then
   echo "waydroid-bt-host: present ($(command -v waydroid-bt-host))"
-elif [ -x /usr/bin/waydroid-bt-host ] || [ -x /usr/local/bin/waydroid-bt-host ]; then
+elif [ -x /usr/bin/waydroid-bt-host ] || [ -x /usr/local/bin/waydroid-bt-host ] || \
+  [ -x /var/lib/waydroid-host-stack/bin/waydroid-bt-host ]; then
   echo "waydroid-bt-host: binary on system path"
 else
   echo "waydroid-bt-host: not found — Soft HCI host not installed by this umbrella"
-  echo "  See docs/pmOS-setup.md / cargo build -p waydroid-bt-host"
+  echo "  Install (root): sudo sh scripts/install-host-system.sh   (see docs/pmOS-setup.md)"
 fi
 if systemctl is-active waydroid-bt-host >/dev/null 2>&1; then
   echo "waydroid-bt-host.service: active"

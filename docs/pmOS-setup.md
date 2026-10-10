@@ -31,28 +31,64 @@ Target: Linux phone with **postmarketOS**, **Phosh**, **BlueZ**, **Waydroid**.
 
 ## Install waydroid-bt-host
 
-From this tree (development):
+Image-based hosts (Nura "Duranium", anything with a read-only `/usr`): see
+[duranium.md](duranium.md). Summary of the generic installer:
 
 ```sh
-cargo build --release -p waydroid-bt-host
-sudo install -Dm755 target/release/waydroid-bt-host /usr/bin/waydroid-bt-host
-sudo install -Dm644 host/systemd/waydroid-bt-host.service \
-  /usr/lib/systemd/system/waydroid-bt-host.service
-sudo install -Dm644 lxc/waydroid-bt-mount.conf \
-  /etc/waydroid-bt/lxc-mount.conf
-sudo systemctl daemon-reload
-sudo systemctl enable --now waydroid-bt-host.service
+# Build (desk, cross): static aarch64 musl binaries, no libdbus needed on the phone
+cargo zigbuild --release --target aarch64-unknown-linux-musl \
+  -p waydroid-bt-host -p waydroid-bt-guest-probe --features waydroid-bt-host/vendored-dbus
+# or natively on a mutable pmOS phone:
+cargo build --release -p waydroid-bt-host -p waydroid-bt-guest-probe
+
+sudo sh scripts/install-host-system.sh            # auto-detects layout
+sh scripts/install-host-system.sh --print-paths   # show where things go
 ```
 
-Or build APKs under `packaging/postmarketos/` (see APKBUILDs).
+Install layout (`scripts/lib/paths.sh`, override with env `PREFIX`, `BINDIR`,
+`SBINDIR`, `LIBEXECDIR`, `UNITDIR`, `SYSCONFDIR`, `FORCE_IMMUTABLE=1|0`):
+
+| | mutable host | image-based host |
+|---|---|---|
+| `PREFIX` | `/usr/local` | `/var/lib/waydroid-host-stack` |
+| `BINDIR` | `$PREFIX/bin` | `$PREFIX/bin` |
+| `SBINDIR` (root helpers) | `$PREFIX/sbin` | `$PREFIX/sbin` |
+| `LIBEXECDIR` (guest probe) | `$PREFIX/libexec` | `$PREFIX/libexec` |
+| `UNITDIR` | `/etc/systemd/system` | `/etc/systemd/system` |
+| `SYSCONFDIR` | `/etc/waydroid-bt` | `/etc/waydroid-bt` |
+
+Or build a systemd-sysext (`sh scripts/build-sysext.sh`, then
+`sudo sh scripts/install-host-system.sh --sysext out/waydroid-host-stack.raw`).
+Distro packages (`packaging/postmarketos/`) keep `/usr/bin` + `/usr/lib/systemd/system`.
+
+Root units installed:
+
+| Unit | Role |
+|---|---|
+| `waydroid-bt-host.service` | BlueZ bridge, socket `/run/waydroid-bt/host.sock` |
+| `waydroid-bt-lxc-include.path/.service` | re-adds `lxc.include` when Waydroid rewrites its LXC config |
+| `waydroid-container.service.d/50-waydroid-bt.conf` | `ExecStartPre`: mkdir socket dir + re-apply include before every container start |
+| `waydroid-bt-inject.timer/.service` | runtime fallback bind if the guest lost the socket |
+| `waydroid-run-xdg.path/.service` | binds `/run/user/<uid>` → `/run/xdg` (replaces `sudo -n` in user hooks) |
 
 ## LXC socket mount
 
-Ensure Waydroid binds the host socket into the container. The fragment in `lxc/waydroid-bt-mount.conf` mounts:
+Host and guest use the **same path**: host `/run/waydroid-bt/host.sock` →
+guest `/run/waydroid-bt/host.sock` (directory rbind). `/dev/socket/waydroid_bt`
+is only an optional convenience symlink created by the inject script.
 
-`/run/waydroid-bt/host.sock` → `/dev/socket/waydroid_bt`
+The fragment `lxc/waydroid-bt-mount.conf` is installed to
+`/etc/waydroid-bt/lxc-mount.conf` and referenced by one line at the **end** of
+`/var/lib/waydroid/lxc/waydroid/config`:
 
-How to apply depends on Waydroid version (config drop-in vs `config_nodes`). See comments in that file.
+```
+lxc.include = /etc/waydroid-bt/lxc-mount.conf
+```
+
+It must come after the `config_nodes` include (which mounts a tmpfs on `/run`).
+Do **not** append to `config_nodes`: Waydroid regenerates it. The include is
+re-applied automatically (path unit + container `ExecStartPre`), so it survives
+`waydroid init` and Waydroid upgrades.
 
 ## Custom Waydroid image
 
@@ -77,6 +113,11 @@ Stock images **strip Bluetooth packages**. Build a custom image with patches fro
 - [ ] Stop `bluetooth.service` → guest reports BT unavailable
 
 ## Device-specific notes
+
+Per-device settings live in `devices/<codename>.conf` (firmware list, NFC,
+half-boot fix, package manager). `scripts/setup-pmos.sh` auto-detects the
+device (`IMAGE_ID`, `/etc/deviceinfo`, device-tree) — override `WHS_DEVICE=`.
+Shipped: `oneplus-fajita`, `oneplus-enchilada`, `generic`.
 
 ### OnePlus 6T (`oneplus-fajita`) — working baseline
 
@@ -125,22 +166,20 @@ Stock images **strip Bluetooth packages**. Build a custom image with patches fro
 
 ```sh
 # On phone (Waydroid session RUNNING, waydroid-bt-host active):
-sudo /usr/local/sbin/waydroid-bt-inject-socket.sh
-sudo /usr/local/sbin/waydroid-guest-bt-probe.sh
+sudo $SBINDIR/waydroid-bt-inject-socket.sh
+sudo $SBINDIR/waydroid-guest-bt-probe.sh
 # LE scan from guest (8s):
 sudo LE_SCAN_SECS=8 /usr/local/sbin/waydroid-guest-bt-probe.sh
 # After session start, wait for LXC then inject:
-sudo /usr/local/sbin/waydroid-bt-session-hook.sh
+sudo $SBINDIR/waydroid-bt-session-hook.sh
 # Expect: PING_OK … ADAPTER_OK powered=true … LE_SCAN_OK ads=N … PROBE_OK
 ```
 
 Install binaries from this repo on the phone after `cargo build --release -p waydroid-bt-host`:
 
 ```sh
-sudo install -Dm755 target/release/waydroid-bt-guest-probe /usr/local/libexec/waydroid-bt-guest-probe
-sudo install -Dm755 scripts/waydroid-bt-inject-socket.sh /usr/local/sbin/waydroid-bt-inject-socket.sh
-sudo install -Dm755 scripts/waydroid-guest-bt-probe.sh /usr/local/sbin/waydroid-guest-bt-probe.sh
-sudo install -Dm755 scripts/waydroid-bt-session-hook.sh /usr/local/sbin/waydroid-bt-session-hook.sh
+# all of these are installed by scripts/install-host-system.sh into $SBINDIR / $LIBEXECDIR
+sudo sh scripts/install-host-system.sh
 ```
 
 ### Restoring `Bluetooth.apk` (done on fajita)
@@ -191,7 +230,8 @@ sudo waydroid shell dumpsys bluetooth_manager
 
 What it does:
 
-1. Patches overlay `libbluetooth_jni.so` (`scripts/waydroid-patch-bt-jni-timerfd.py`) — three AArch64 sites `mov w0,#9` → `#7` (BOOTTIME).
+0. Refuses unless the image is Lineage 20 / Android 13 (SDK 33, build id `TQ3A*`), read from `system.img` via `debugfs` (`scripts/lib/lineage-guard.sh`; override `WAYDROID_BT_SKIP_VERSION_GUARD=1`). `waydroid-restore-bluetooth-apk.sh` has the same guard.
+1. Patches overlay `libbluetooth_jni.so` with `waydroid-bt-jni-patch` (Rust, no python3; the `.py` is a desk fallback) — three AArch64 sites `mov w0,#9` → `#7` (BOOTTIME).
 2. Seeds/appends `ro.bluetooth.ble_start_timeout_delay=86400000` on overlay `system/build.prop`.
 
 **Hard next step for Android app BLE:** complete Alternative E so `bringUpBle` finishes (minimal HCI HAL **or** BlueZ-backed binder backend). Adapter may remain `BLE_TURNING_ON` until then; host BlueZ must stay sole radio owner.

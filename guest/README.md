@@ -41,11 +41,12 @@ Use the host-built musl binary + inject scripts (not the C connectivity stub):
 |----------|------|
 | `host/src/bin/waydroid-bt-guest-probe.rs` | Blocking Ping + GetAdapterInfo client |
 | `scripts/waydroid-bt-inject-socket.sh` | Bind-mount `/run/waydroid-bt` into LXC |
-| `scripts/waydroid-guest-bt-probe.sh` | Stage binary into guest + `nsenter -m` run |
+| `scripts/waydroid-guest-bt-probe.sh` | Stage binary into guest + run via `lxc-attach` (nsenter fallback) |
 
 ```sh
-sudo /usr/local/sbin/waydroid-bt-inject-socket.sh
-sudo /usr/local/sbin/waydroid-guest-bt-probe.sh
+# SBINDIR: see `sh scripts/install-host-system.sh --print-paths`
+sudo $SBINDIR/waydroid-bt-inject-socket.sh
+sudo $SBINDIR/waydroid-guest-bt-probe.sh
 # → PING_OK / ADAPTER_OK powered=true / PROBE_OK
 ```
 

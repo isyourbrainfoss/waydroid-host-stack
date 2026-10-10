@@ -63,6 +63,26 @@ if [ -z "$APK" ] || [ ! -f "$APK" ]; then
 	exit 1
 fi
 
+# Only Lineage 20 / Android 13 (SDK 33, TQ3A) is supported by this overlay.
+SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+LIBDIR="${WHS_LIBDIR:-$SCRIPT_DIR/lib}"
+[ -d "$LIBDIR" ] || LIBDIR="${PREFIX:-/var/lib/waydroid-host-stack}/lib"
+# shellcheck source=scripts/lib/lineage-guard.sh
+. "$LIBDIR/lineage-guard.sh"
+if ! whs_lineage_guard; then
+	echo "RESTORE_REFUSED (version guard)" >&2
+	exit 1
+fi
+case "$VERSION_DIR" in
+Bluetooth@"$WAYDROID_BT_REQUIRED_BUILD_PREFIX"*) ;;
+*)
+	if [ "${WAYDROID_BT_SKIP_VERSION_GUARD:-0}" != "1" ]; then
+		echo "RESTORE_REFUSED: version_dir '$VERSION_DIR' is not Bluetooth@$WAYDROID_BT_REQUIRED_BUILD_PREFIX*" >&2
+		exit 1
+	fi
+	;;
+esac
+
 if command -v aapt >/dev/null 2>&1; then
 	pkg=$(aapt dump badging "$APK" 2>/dev/null | sed -n "s/package: name='\([^']*\)'.*/\1/p" | head -1)
 	echo "apk package name: ${pkg:-unknown}"

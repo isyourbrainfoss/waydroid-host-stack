@@ -6,9 +6,10 @@ export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=$XDG_RUNTIME_DIR/bus}"
 export WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-wayland-0}"
 
-if [ ! -e /run/xdg/wayland-0 ] && [ -S "${XDG_RUNTIME_DIR}/wayland-0" ]; then
-  sudo -n mkdir -p /run/xdg 2>/dev/null || true
-  sudo -n mount --bind "$XDG_RUNTIME_DIR" /run/xdg 2>/dev/null || true
+# /run/xdg is bound by the root unit waydroid-run-xdg.path/.service
+# (installed by install-host-system.sh). No sudo from user hooks.
+if [ ! -e /run/xdg/wayland-0 ] && [ -S "$XDG_RUNTIME_DIR/wayland-0" ]; then
+  systemctl start --no-ask-password waydroid-run-xdg.service 2>/dev/null || true
 fi
 
 if command -v waydroid-gps-forward >/dev/null 2>&1; then

@@ -2,7 +2,7 @@
 # One desk gate: forwarder smoke selftests + cargo test --workspace.
 # Exit non-zero if any component fails.
 set -eu
-ROOT="$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)"
+ROOT="$(CDPATH='' cd -- "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
 fail=0
