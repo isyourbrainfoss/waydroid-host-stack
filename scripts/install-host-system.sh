@@ -113,7 +113,7 @@ waydroid-run-xdg.service waydroid-run-xdg.path"
 SBIN_SCRIPTS="waydroid-bt-inject-socket.sh waydroid-bt-session-hook.sh
 waydroid-guest-bt-probe.sh waydroid-bt-apply-lxc-include.sh waydroid-run-xdg-bind.sh
 waydroid-bt-stabilize-adapter.sh waydroid-restore-bluetooth-apk.sh
-waydroid-patch-bt-jni-timerfd.py"
+waydroid-patch-bt-jni-timerfd.py waydroid-install-soft-hci-hal.sh"
 
 stage() {
 	D="$DESTDIR"
@@ -143,6 +143,11 @@ stage() {
 	done
 	for l in paths.sh device.sh lineage-guard.sh; do
 		run install -Dm0644 "$ROOT/scripts/lib/$l" "$D$SBINDIR/lib/$l"
+	done
+	# Guest HAL launcher/.rc/VINTF manifest for waydroid-install-soft-hci-hal.sh
+	for h in bluetooth-hci-waydroid.sh android.hardware.bluetooth@1.0-service.waydroid.rc \
+		manifest_android.hardware.bluetooth@1.0.xml; do
+		run install -Dm0644 "$ROOT/guest/hal/$h" "$D$SBINDIR/guest-hal/$h"
 	done
 
 	subst "$ROOT/host/systemd/waydroid-bt-host.service" "$D$UNITDIR/waydroid-bt-host.service"
@@ -196,7 +201,7 @@ uninstall() {
 	for b in waydroid-bt-host waydroid-bt-ping waydroid-bt-jni-patch; do run rm -f "$BINDIR/$b"; done
 	run rm -f "$LIBEXECDIR/waydroid-bt-guest-probe"
 	for s in $SBIN_SCRIPTS; do run rm -f "$SBINDIR/$s"; done
-	run rm -rf "$SBINDIR/lib"
+	run rm -rf "$SBINDIR/lib" "$SBINDIR/guest-hal"
 	cfg="$WAYDROID_LXC_DIR/config"
 	if [ -f "$cfg" ] && grep -q "lxc.include = $SYSCONFDIR/lxc-mount.conf" "$cfg"; then
 		if [ "$DRY" = 1 ]; then

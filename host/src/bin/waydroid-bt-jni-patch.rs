@@ -5,6 +5,10 @@
 //! phone host does not need python3 (image-based hosts such as Nura/Duranium
 //! ship without it).
 //!
+//! Sites: the three known TQ3A offsets if they match; otherwise the patcher
+//! resolves `timerfd_create@plt` from .rela.plt/.dynsym and scans .text for
+//! `mov w0,#9` right before `bl timerfd_create` (rebuilt images move code).
+//!
 //! Usage:
 //!   waydroid-bt-jni-patch INPUT.so OUTPUT.so
 //!   waydroid-bt-jni-patch --check INPUT.so
@@ -57,6 +61,124 @@ pub fn va_to_off(d: &[u8], va: u64) -> Result<usize, String> {
     Err(format!("va {va:#x} not in any PT_LOAD"))
 }
 
+
+struct Section {
+    name: String,
+    addr: u64,
+    offset: u64,
+    size: u64,
+    link: u32,
+}
+
+fn sections(d: &[u8]) -> Result<Vec<Section>, String> {
+    let shoff = rd_u64(d, 0x28)? as usize;
+    let shentsize = rd_u16(d, 0x3a)? as usize;
+    let shnum = rd_u16(d, 0x3c)? as usize;
+    let shstrndx = rd_u16(d, 0x3e)? as usize;
+    let mut raw = Vec::new();
+    for i in 0..shnum {
+        let o = shoff + i * shentsize;
+        raw.push((
+            rd_u32(d, o)?,
+            rd_u64(d, o + 0x10)?,
+            rd_u64(d, o + 0x18)?,
+            rd_u64(d, o + 0x20)?,
+            rd_u32(d, o + 0x28)?,
+        ));
+    }
+    let stroff = raw.get(shstrndx).ok_or("bad shstrndx")?.2 as usize;
+    Ok(raw
+        .into_iter()
+        .map(|(n, addr, offset, size, link)| Section {
+            name: cstr(d, stroff + n as usize),
+            addr,
+            offset,
+            size,
+            link,
+        })
+        .collect())
+}
+
+fn cstr(d: &[u8], o: usize) -> String {
+    let end = d[o.min(d.len())..].iter().position(|&b| b == 0).map(|p| o + p).unwrap_or(d.len());
+    String::from_utf8_lossy(&d[o.min(d.len())..end]).into_owned()
+}
+
+/// Address of the `timerfd_create@plt` stub (AArch64 lazy PLT layout:
+/// 32-byte header, then one 16-byte stub per .rela.plt entry, in order).
+fn timerfd_plt_addr(d: &[u8]) -> Result<u64, String> {
+    let secs = sections(d)?;
+    let find = |n: &str| secs.iter().find(|s| s.name == n).ok_or(format!("no {n} section"));
+    let rela = find(".rela.plt")?;
+    let plt = find(".plt")?;
+    let dynsym = secs.get(rela.link as usize).ok_or("bad .rela.plt link")?;
+    let dynstr = secs.get(dynsym.link as usize).ok_or("bad .dynsym link")?;
+    let n = (rela.size / 24) as usize;
+    for i in 0..n {
+        let o = rela.offset as usize + i * 24;
+        let info = rd_u64(d, o + 8)?;
+        let sym = (info >> 32) as usize;
+        let name_off = rd_u32(d, dynsym.offset as usize + sym * 24)? as usize;
+        if cstr(d, dynstr.offset as usize + name_off) == "timerfd_create" {
+            return Ok(plt.addr + 0x20 + 16 * i as u64);
+        }
+    }
+    Err("timerfd_create not imported".into())
+}
+
+/// Scan .text for `mov w0,#9|#7` up to 4 insns before `bl timerfd_create@plt`
+/// (only `mov w1,wzr` / insns not writing w0 in between). Returns VAs.
+pub fn scan_sites(d: &[u8]) -> Result<Vec<u64>, String> {
+    let target = timerfd_plt_addr(d)?;
+    let secs = sections(d)?;
+    let text = secs.iter().find(|s| s.name == ".text").ok_or("no .text")?;
+    let mut out = Vec::new();
+    let mut i = 0u64;
+    while i + 4 <= text.size {
+        let insn = rd_u32(d, (text.offset + i) as usize)?;
+        if insn & 0xfc00_0000 == 0x9400_0000 {
+            let imm = (insn & 0x03ff_ffff) as i64;
+            let imm = (imm << 38) >> 36; // sign-extend 26 bits, *4
+            let pc = text.addr + i;
+            if pc.wrapping_add(imm as u64) == target {
+                let mut k = 1u64;
+                while k <= 4 && i >= 4 * k {
+                    let prev = rd_u32(d, (text.offset + i - 4 * k) as usize)?;
+                    if prev == MOV_W0_IMM9 || prev == MOV_W0_IMM7 {
+                        out.push(pc - 4 * k);
+                        break;
+                    }
+                    // stop if something else writes w0/x0 (Rd==0, data-processing)
+                    if prev & 0x1f == 0 && prev & 0x1c00_0000 != 0x0800_0000 {
+                        break;
+                    }
+                    k += 1;
+                }
+            }
+        }
+        i += 4;
+    }
+    Ok(out)
+}
+
+/// Known sites if they match, otherwise scanned sites.
+fn resolve_sites(d: &[u8]) -> Result<Vec<u64>, String> {
+    let known_ok = DEFAULT_SITES.iter().all(|&va| {
+        va_to_off(d, va)
+            .and_then(|o| rd_u32(d, o))
+            .map(|c| c == MOV_W0_IMM9 || c == MOV_W0_IMM7)
+            .unwrap_or(false)
+    });
+    if known_ok {
+        return Ok(DEFAULT_SITES.to_vec());
+    }
+    let s = scan_sites(d)?;
+    if s.is_empty() {
+        return Err("no `mov w0,#9; bl timerfd_create` sites found".into());
+    }
+    Ok(s)
+}
+
 /// Returns (patched_now, already_patched). Errors on unexpected instructions.
 pub fn patch(d: &mut [u8], dry_run: bool) -> Result<(usize, usize), String> {
     if d.len() < 64 || &d[..4] != b"\x7fELF" {
@@ -65,8 +187,13 @@ pub fn patch(d: &mut [u8], dry_run: bool) -> Result<(usize, usize), String> {
     if d[4] != 2 || d[5] != 1 {
         return Err("expected ELF64 little-endian".into());
     }
+    let sites = if d.len() > 0x40 && rd_u16(d, 0x3c).unwrap_or(0) > 0 {
+        resolve_sites(d)?
+    } else {
+        DEFAULT_SITES.to_vec()
+    };
     let mut offs = Vec::new();
-    for va in DEFAULT_SITES {
+    for va in sites {
         let off = va_to_off(d, va)?;
         let cur = rd_u32(d, off)?;
         if cur != MOV_W0_IMM9 && cur != MOV_W0_IMM7 {
@@ -112,7 +239,7 @@ fn main() -> ExitCode {
     if check {
         return match patch(&mut data, true) {
             Ok((n, a)) => {
-                println!("CHECK_OK sites={} need_patch={n} already={a}", DEFAULT_SITES.len());
+                println!("CHECK_OK sites={} need_patch={n} already={a}", n + a);
                 ExitCode::SUCCESS
             }
             Err(e) => {
