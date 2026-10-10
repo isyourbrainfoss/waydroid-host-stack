@@ -103,6 +103,7 @@ subst() {
 	fi
 	sed -e "s|@SBINDIR@|$SBINDIR|g" \
 		-e "s|@WAYDROID_UID@|$(waydroid_uid)|g" \
+		-e "s|@WAYDROID_USER@|$(getent passwd "$(waydroid_uid)" | cut -d: -f1)|g" \
 		-e "s|@BINDIR@|$BINDIR|g" \
 		-e "s|/usr/bin/waydroid-bt-host|$BINDIR/waydroid-bt-host|g" \
 		"$1" >"$2"
@@ -145,7 +146,7 @@ stage() {
 	for s in $SBIN_SCRIPTS; do
 		run install -Dm0755 "$ROOT/scripts/$s" "$D$SBINDIR/$s"
 	done
-	for l in paths.sh device.sh lineage-guard.sh; do
+	for l in paths.sh device.sh lineage-guard.sh guest.sh; do
 		run install -Dm0644 "$ROOT/scripts/lib/$l" "$D$SBINDIR/lib/$l"
 	done
 	# Guest HAL launcher/.rc/VINTF manifest for waydroid-install-soft-hci-hal.sh

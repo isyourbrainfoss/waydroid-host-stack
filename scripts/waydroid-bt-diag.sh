@@ -27,12 +27,9 @@ if [ "$(id -u)" -ne 0 ]; then
 	exit 1
 fi
 
-gsh() {
-	timeout 30 lxc-attach -P "$LXC_PATH" -n waydroid --clear-env \
-		-v PATH=/product/bin:/apex/com.android.runtime/bin:/system/bin:/system/xbin:/vendor/bin \
-		-v ANDROID_ROOT=/system -v ANDROID_DATA=/data -v HOME=/data \
-		-- /system/bin/sh -c "$1" 2>&1
-}
+export WHS_AUTO_THAW=1  # maintenance: thaw if Waydroid suspends mid-run
+# shellcheck source=lib/guest.sh
+. "$(CDPATH='' cd -- "$(dirname "$0")" && pwd)/lib/guest.sh"
 sec() { printf '\n########## %s ##########\n' "$1"; }
 run() { sec "$*"; sh -c "$*" 2>&1; }
 g() { sec "guest: $1"; gsh "$1"; }
@@ -53,6 +50,8 @@ bt_state() {
 	run "cd /var/lib/waydroid/overlay && find . -type f | sort | xargs -r sha256sum"
 	run "ls -Z /sys/fs/selinux 2>/dev/null | head -3; cat /sys/fs/selinux/enforce 2>/dev/null || echo no-selinuxfs"
 
+	sec "container state: $(whs_container_state)"
+	whs_container_thaw || echo "WARN: container not RUNNING after thaw"
 	PID=$(lxc-info -P "$LXC_PATH" -n waydroid -pH 2>/dev/null || true)
 	sec "container pid=$PID"
 	if [ -z "$PID" ] || [ "$PID" = "-1" ]; then
@@ -74,7 +73,7 @@ bt_state() {
 		g 'logcat -d -b crash | tail -80'
 		g 'logcat -d -b all -v threadtime | grep -iE "bt_hci_waydroid|Soft HCI|bluetooth|bt_stack|bt_btif|bt_hci|hci_hal|HidlServiceManagement|hwservicemanager|vintf|BluetoothManager|AdapterState|AdapterService|avc:" | tail -400'
 		g 'dmesg 2>/dev/null | grep -iE "avc|bluetooth|binder" | tail -40'
-		gsh 'logcat -d -b all -v threadtime' | gzip >"$OUT.logcat.gz"
+		gsh 'logcat -d -b all -v threadtime' 90 | gzip >"$OUT.logcat.gz"
 		echo "full logcat: $OUT.logcat.gz"
 
 		if [ "$TOGGLE" = 1 ]; then
