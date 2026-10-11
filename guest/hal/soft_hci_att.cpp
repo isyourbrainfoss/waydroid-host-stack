@@ -73,6 +73,7 @@ void SoftAttLink::reset() {
   peer_type_ = 0;
   att_mtu_ = 23;
   attrs_.clear();
+  prepared_.clear();
   ops_ = {};
 }
 
@@ -579,16 +580,89 @@ void SoftAttLink::handle_att(const uint8_t* pdu, size_t len,
       }
       return;
     }
+    bool ok = true;
     if (a->kind == Attr::kValue && ops_.write_char) {
-      ops_.write_char(a->char_uuid, a->service_uuid, value, op == 0x52);
+      ok = ops_.write_char(a->char_uuid, a->service_uuid, value, op == 0x52);
     }
     if (op == 0x12) {
+      if (!ok) {
+        send_error(op, handle, 0x0E /* Unlikely Error */, emit_acl);
+        return;
+      }
       Packet rsp;
       rsp.push_back(0x13);
       send_att(rsp, emit_acl);
     }
     return;
   }
+
+  // Prepare Write Request: value longer than ATT_MTU-3 (Android long write,
+  // e.g. Tesla VCSEC 285-byte add-key message at MTU 250). Queue + echo.
+  if (op == 0x16 && len >= 5) {
+    const uint16_t handle = rd16(pdu + 1);
+    const uint16_t offset = rd16(pdu + 3);
+    if (!find_handle(handle)) {
+      send_error(op, handle, 0x01 /* Invalid Handle */, emit_acl);
+      return;
+    }
+    if (prepared_.size() >= 64) {
+      send_error(op, handle, 0x09 /* Prepare Queue Full */, emit_acl);
+      return;
+    }
+    prepared_.push_back({handle, offset, std::vector<uint8_t>(pdu + 5, pdu + len)});
+    Packet rsp(pdu, pdu + len);
+    rsp[0] = 0x17;
+    send_att(rsp, emit_acl);
+    return;
+  }
+
+  // Execute Write Request: flags 0x00 cancel, 0x01 write all queued values.
+  if (op == 0x18 && len >= 2) {
+    std::vector<PreparedWrite> q;
+    q.swap(prepared_);
+    if (pdu[1] == 0x01) {
+      // Assemble per handle in queue order; offsets must be contiguous.
+      std::vector<std::pair<uint16_t, std::vector<uint8_t>>> bufs;
+      for (const auto& pw : q) {
+        std::vector<uint8_t>* buf = nullptr;
+        for (auto& b : bufs) {
+          if (b.first == pw.handle) buf = &b.second;
+        }
+        if (!buf) {
+          bufs.push_back({pw.handle, {}});
+          buf = &bufs.back().second;
+        }
+        if (pw.offset != buf->size()) {
+          send_error(op, pw.handle, 0x07 /* Invalid Offset */, emit_acl);
+          return;
+        }
+        buf->insert(buf->end(), pw.value.begin(), pw.value.end());
+      }
+      for (auto& b : bufs) {
+        Attr* a = find_handle(b.first);
+        if (!a) {
+          send_error(op, b.first, 0x01, emit_acl);
+          return;
+        }
+        if (a->kind == Attr::kCccd) {
+          a->static_value = b.second;
+          continue;
+        }
+        if (a->kind == Attr::kValue && ops_.write_char &&
+            !ops_.write_char(a->char_uuid, a->service_uuid, b.second, false)) {
+          send_error(op, b.first, 0x0E, emit_acl);
+          return;
+        }
+      }
+    }
+    Packet rsp;
+    rsp.push_back(0x19);
+    send_att(rsp, emit_acl);
+    return;
+  }
+
+  // Handle Value Confirmation (only after an indication we never send): ignore.
+  if (op == 0x1E) return;
 
   // Unsupported
   send_error(op, 0x0000, 0x06 /* Request Not Supported */, emit_acl);

@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <sys/socket.h>
 #include <unistd.h>
 // Host-side unit tests for SoftHci + Soft ATT pure helpers (no Android HIDL).
@@ -878,7 +879,73 @@ static void test_notification_during_write_is_queued() {
   printf("ok notification_during_write_is_queued\n");
 }
 
+
+// Long write (Prepare 0x16 x2 + Execute 0x18) must reach the host as ONE write
+// of the reassembled value (Tesla add-key 285 B at MTU 250 was dropped).
+static void test_prepared_long_write_reassembled() {
+  SoftAttLink link;
+  link.set_conn_handle(0x0040);
+  link.set_peer("AA:BB:CC:DD:EE:30", 1);
+  link.build_from_uuids(
+      {{"00000211-b2d1-43f0-9b88-960cebf8b91e",
+        {{"00000212-b2d1-43f0-9b88-960cebf8b91e", 0x0c}}}});
+  std::vector<uint8_t> written;
+  int writes = 0;
+  waydroid_bt::AttHostOps ops;
+  ops.write_char = [&](const std::string& cu, const std::string&, const std::vector<uint8_t>& v,
+                       bool) {
+    if (cu.find("0212") == std::string::npos) return true;
+    written = v;
+    writes++;
+    return true;
+  };
+  link.set_host_ops(ops);
+  // Find value handle of 0212 via Read By Type? Use handle scan: try 0x0001..0x0020.
+  uint16_t vh = 0;
+  for (uint16_t h = 1; h < 0x40 && !vh; h++) {
+    std::vector<Packet> out;
+    auto emit = [&](const Packet& p) { out.push_back(p); };
+    auto ev = [&](const Packet&) {};
+    // Prepare Write probe at offset 0 with 1 byte; success response 0x17 means handle exists.
+    Packet acl = {0x40, 0x20, 0, 0, 0, 0, 0x04, 0x00, 0x16,
+                  static_cast<uint8_t>(h), static_cast<uint8_t>(h >> 8), 0, 0, 0xAA};
+    acl[2] = static_cast<uint8_t>(acl.size() - 4);
+    acl[4] = static_cast<uint8_t>(acl.size() - 8);
+    link.on_acl_from_stack(acl, emit, ev);
+    // Execute: only the 0212 value handle reaches write_char.
+    int before = writes;
+    Packet exec1 = {0x40, 0x20, 6, 0, 2, 0, 0x04, 0x00, 0x18, 0x01};
+    link.on_acl_from_stack(exec1, emit, ev);
+    if (writes > before) vh = h;
+  }
+  assert(vh != 0);
+  writes = 0;
+  std::vector<uint8_t> full(285);
+  for (size_t i = 0; i < full.size(); i++) full[i] = static_cast<uint8_t>(i);
+  std::vector<Packet> out;
+  auto emit = [&](const Packet& p) { out.push_back(p); };
+  auto ev = [&](const Packet&) {};
+  for (size_t off = 0; off < full.size(); off += 245) {
+    size_t n = std::min<size_t>(245, full.size() - off);
+    Packet acl = {0x40, 0x20, 0, 0, 0, 0, 0x04, 0x00, 0x16, static_cast<uint8_t>(vh),
+                  static_cast<uint8_t>(vh >> 8), static_cast<uint8_t>(off),
+                  static_cast<uint8_t>(off >> 8)};
+    acl.insert(acl.end(), full.begin() + off, full.begin() + off + n);
+    uint16_t dl = static_cast<uint16_t>(acl.size() - 4), ll = static_cast<uint16_t>(acl.size() - 8);
+    acl[2] = dl & 0xff; acl[3] = dl >> 8; acl[4] = ll & 0xff; acl[5] = ll >> 8;
+    link.on_acl_from_stack(acl, emit, ev);
+    assert(out.back()[8] == 0x17);
+  }
+  assert(writes == 0);
+  Packet exec = {0x40, 0x20, 6, 0, 2, 0, 0x04, 0x00, 0x18, 0x01};
+  link.on_acl_from_stack(exec, emit, ev);
+  assert(out.back()[8] == 0x19);
+  assert(writes == 1 && written == full);
+  printf("ok prepared_long_write_reassembled len=%zu\n", written.size());
+}
+
 int main() {
+  test_prepared_long_write_reassembled();
   test_notification_during_write_is_queued();
   test_opcode_of();
   test_command_complete_shape();
