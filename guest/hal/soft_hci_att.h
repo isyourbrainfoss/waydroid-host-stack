@@ -102,6 +102,13 @@ class SoftAttLink {
   uint8_t peer_type_ = 0;
   uint16_t att_mtu_ = 23;
   AttHostOps ops_;
+  // Queued Prepare Write Requests (ATT long/reliable write), executed on 0x18.
+  struct PreparedWrite {
+    uint16_t handle;
+    uint16_t offset;
+    std::vector<uint8_t> value;
+  };
+  std::vector<PreparedWrite> prepared_;
   std::vector<Attr> attrs_;
 };
 
