@@ -1041,7 +1041,7 @@ case "$cmd" in
   disable) disable_autostart ;;
   selftest) selftest ;;
   seed) seed_cmd "$@" ;;
-  seed-from-host) seed_from_host ;;
+  seed-from-host) seed_from_host "$@" ;;
   toggle)
     if is_running; then stop; else start; fi
     ;;
