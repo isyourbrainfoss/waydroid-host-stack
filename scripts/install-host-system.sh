@@ -118,7 +118,7 @@ SBIN_SCRIPTS="waydroid-bt-inject-socket.sh waydroid-bt-session-hook.sh
 waydroid-guest-bt-probe.sh waydroid-bt-apply-lxc-include.sh waydroid-run-xdg-bind.sh
 waydroid-bt-stabilize-adapter.sh waydroid-restore-bluetooth-apk.sh
 waydroid-patch-bt-jni-timerfd.py waydroid-install-soft-hci-hal.sh
-waydroid-gps-inject.sh waydroid-bt-diag.sh waydroid-bt-grant-perms.sh"
+waydroid-gps-inject.sh waydroid-bt-diag.sh waydroid-bt-grant-perms.sh waydroid-install-microg.sh"
 
 stage() {
 	D="$DESTDIR"

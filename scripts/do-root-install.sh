@@ -4,6 +4,7 @@
 #
 #   sudo sh scripts/do-root-install.sh [ARTIFACTS_DIR]   full install + checks
 #   sudo sh scripts/do-root-install.sh --diag            diagnostics only
+#   sudo sh scripts/do-root-install.sh --microg          host daemon update + microG (Waydroid running)
 #   sudo sh scripts/do-root-install.sh --fix-bt          BT perms + toggle + diag (Waydroid running)
 #
 # Always ends with a guest diagnostic dump (~<user>/waydroid-bt-diag-*.txt) and
@@ -24,6 +25,7 @@ MODE=install
 case "${1:-}" in
 --diag) MODE=diag; shift ;;
 --fix-bt) MODE=fixbt; shift ;;
+--microg) MODE=microg; shift ;;
 esac
 ART="${1:-$ROOT/artifacts}"
 U="${SUDO_USER:-${DOAS_USER:-kb}}"
@@ -45,7 +47,11 @@ if [ -z "${WHS_LOGGING:-}" ]; then
 	tee -a "$LOG" <"$fifo" &
 	teepid=$!
 	set +e
-	if [ "$MODE" != install ]; then set -- "--$( [ "$MODE" = fixbt ] && echo fix-bt || echo diag)" "$@"; fi
+	case "$MODE" in
+	fixbt) set -- --fix-bt "$@" ;;
+	diag) set -- --diag "$@" ;;
+	microg) set -- --microg "$@" ;;
+	esac
 	sh "$0" "$@" >"$fifo" 2>&1
 	rc=$?
 	wait "$teepid"
@@ -67,6 +73,24 @@ echo "################ do-root-install $(date -u +%Y-%m-%dT%H:%M:%SZ) mode=$MODE
 echo "repo=$ROOT artifacts=$ART user=$U uid=$UID_N"
 
 DIAG="$ROOT/scripts/waydroid-bt-diag.sh"
+if [ "$MODE" = microg ]; then
+	# Short mode: update host daemon (GATT write logging) + install microG.
+	STEP="host daemon update"
+	. "$ROOT/scripts/lib/paths.sh"
+	FORCE_IMMUTABLE=1 whs_resolve_paths
+	(cd "$ART" && sha256sum -c SHA256SUMS)
+	if ! cmp -s "$ART/bin/waydroid-bt-host" "$BINDIR/waydroid-bt-host"; then
+		install -m0755 "$ART/bin/waydroid-bt-host" "$BINDIR/waydroid-bt-host"
+		systemctl restart waydroid-bt-host
+		sleep 1
+		systemctl is-active waydroid-bt-host
+	fi
+	STEP=microg
+	sh "$ROOT/scripts/waydroid-install-microg.sh" "$ART/microg"
+	STEP=finished
+	echo "DO_ROOT_MICROG_OK"
+	exit 0
+fi
 if [ "$MODE" = diag ]; then
 	STEP=diag
 	sh "$DIAG" --out "$UHOME/waydroid-bt-diag-$(date -u +%Y%m%d-%H%M%SZ).txt"

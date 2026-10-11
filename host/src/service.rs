@@ -7,7 +7,7 @@ use anyhow::Result;
 use bytes::Bytes;
 use futures::StreamExt;
 use tokio::sync::{mpsc, Mutex};
-use tracing::info;
+use tracing::{info, warn};
 use waydroid_bt_protocol::{
     envelope, err_response, event, event_envelope, ok_response, request, response, AdvReportEvent,
     BtAddress, ConnectionState, ConnectionStateEvent, Envelope, ErrorCode, GattNotificationEvent,
@@ -327,11 +327,20 @@ impl BridgeService {
                     )
                     .await
                 {
-                    Ok(()) => ok_response(
-                        request_id,
-                        response::Result::GattWrite(waydroid_bt_protocol::GattWriteResponse {}),
-                    ),
-                    Err(e) => err_response(request_id, ErrorCode::Bluez, e.to_string()),
+                    Ok(()) => {
+                        info!(device_id = %req.device_id, char_uuid = %req.characteristic_uuid,
+                              len = req.value.len(), without_response = req.without_response,
+                              "gatt write ok");
+                        ok_response(
+                            request_id,
+                            response::Result::GattWrite(waydroid_bt_protocol::GattWriteResponse {}),
+                        )
+                    }
+                    Err(e) => {
+                        warn!(device_id = %req.device_id, char_uuid = %req.characteristic_uuid,
+                              len = req.value.len(), error = %e, "gatt write failed");
+                        err_response(request_id, ErrorCode::Bluez, e.to_string())
+                    }
                 }
             }
             request::Op::GattSetNotify(req) => {
