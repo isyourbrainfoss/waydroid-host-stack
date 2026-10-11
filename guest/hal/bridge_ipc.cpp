@@ -83,6 +83,7 @@ BridgeIpc::~BridgeIpc() { close(); }
 
 void BridgeIpc::close_locked() {
   // Caller holds io_mu_. Do not lock again (mutex is non-recursive).
+  pending_.clear();
   if (fd_ >= 0) {
     ::close(fd_);
     fd_ = -1;
@@ -163,6 +164,19 @@ bool BridgeIpc::write_frame(const std::vector<uint8_t>& payload) {
 }
 
 bool BridgeIpc::read_frame(std::vector<uint8_t>& payload) {
+  for (;;) {
+    if (!read_frame_raw(payload)) return false;
+    PendingNotification n;
+    if (!parse_gatt_notification(payload.data(), payload.size(), &n.char_uuid, &n.value,
+                                 &n.device_id)) {
+      return true;
+    }
+    if (pending_.size() >= 512) pending_.pop_front();
+    pending_.push_back(std::move(n));
+  }
+}
+
+bool BridgeIpc::read_frame_raw(std::vector<uint8_t>& payload) {
   uint8_t hdr[4];
   if (!read_exact(hdr, 4)) return false;
   uint32_t len = static_cast<uint32_t>(hdr[0]) | (static_cast<uint32_t>(hdr[1]) << 8) |
@@ -1232,28 +1246,36 @@ bool BridgeIpc::poll_gatt_notification(std::string* char_uuid_out, std::vector<u
     ::poll(nullptr, 0, 20);
     return false;
   }
-  if (fd_ < 0) return false;
-  pollfd pfd{};
-  pfd.fd = fd_;
-  pfd.events = POLLIN;
-  // Keep lock for poll+read; timeout is short (caller uses 200ms).
-  int pr = ::poll(&pfd, 1, timeout_ms);
-  if (pr <= 0) return false;
-  if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) {
-    // Already hold io_mu_; public close() would self-deadlock.
-    close_locked();
-    return false;
-  }
-  std::vector<uint8_t> frame;
-  if (!read_frame(frame)) {
-    close_locked();
-    return false;
-  }
   std::string dev;
   std::string cu;
   std::vector<uint8_t> val;
-  if (!parse_gatt_notification(frame.data(), frame.size(), &cu, &val, &dev)) {
-    return false;
+  if (!pending_.empty()) {
+    // Delivered in arrival order, ahead of anything still on the socket.
+    dev = std::move(pending_.front().device_id);
+    cu = std::move(pending_.front().char_uuid);
+    val = std::move(pending_.front().value);
+    pending_.pop_front();
+  } else {
+    if (fd_ < 0) return false;
+    pollfd pfd{};
+    pfd.fd = fd_;
+    pfd.events = POLLIN;
+    // Keep lock for poll+read; timeout is short (caller uses 200ms).
+    int pr = ::poll(&pfd, 1, timeout_ms);
+    if (pr <= 0) return false;
+    if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) {
+      // Already hold io_mu_; public close() would self-deadlock.
+      close_locked();
+      return false;
+    }
+    std::vector<uint8_t> frame;
+    if (!read_frame_raw(frame)) {
+      close_locked();
+      return false;
+    }
+    if (!parse_gatt_notification(frame.data(), frame.size(), &cu, &val, &dev)) {
+      return false;
+    }
   }
   if (!device_id_filter.empty() && !dev.empty()) {
     // Case-insensitive match (BlueZ ids are typically uppercase addresses).
