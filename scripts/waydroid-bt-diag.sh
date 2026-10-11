@@ -73,6 +73,8 @@ bt_state() {
 		g 'ls -la /data/misc/bluetooth /data/misc/bluetooth/logs /data/tombstones 2>&1 | head -40'
 		g 'logcat -d -b crash | tail -80'
 		g 'logcat -d -b all -v threadtime | grep -iE "bt_hci_waydroid|Soft HCI|bluetooth|bt_stack|bt_btif|bt_hci|hci_hal|HidlServiceManagement|hwservicemanager|vintf|BluetoothManager|AdapterState|AdapterService|avc:" | tail -400'
+		g 'logcat -d -b all -v threadtime | grep -iE "tesla|vcsec|BLEVehicle|whitelist|keycard|phonekey|phone key|BluetoothGatt|GattService|bt_gatt|Soft HCI|bt_hci_waydroid|microg|GmsCore" | tail -600'
+		g 'pm list packages --show-versioncode | grep -iE "tesla|google.android.gms|android.vending"'
 		g 'dmesg 2>/dev/null | grep -iE "avc|bluetooth|binder" | tail -40'
 		gsh 'logcat -d -b all -v threadtime' 90 | gzip >"$OUT.logcat.gz"
 		echo "full logcat: $OUT.logcat.gz"
