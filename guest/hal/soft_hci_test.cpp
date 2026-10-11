@@ -1,3 +1,5 @@
+#include <sys/socket.h>
+#include <unistd.h>
 // Host-side unit tests for SoftHci + Soft ATT pure helpers (no Android HIDL).
 #include "bridge_ipc.h"
 #include "soft_hci.h"
@@ -818,7 +820,66 @@ static void test_parse_response_ok_missing_error_field() {
   printf("ok parse_response_ok_missing_error_field\n");
 }
 
+// A GattNotification that arrives while gatt_write waits for its Response must
+// be queued and later returned by poll_gatt_notification (Tesla VCSEC replies
+// to a write before the write completes). Previously it was silently dropped.
+static void test_notification_during_write_is_queued() {
+  auto put_varint = [](std::vector<uint8_t>& o, uint64_t v) {
+    while (v >= 0x80) {
+      o.push_back(static_cast<uint8_t>((v & 0x7f) | 0x80));
+      v >>= 7;
+    }
+    o.push_back(static_cast<uint8_t>(v));
+  };
+  auto put_key = [&](std::vector<uint8_t>& o, uint32_t f, uint32_t w) {
+    put_varint(o, (static_cast<uint64_t>(f) << 3) | w);
+  };
+  auto put_sub = [&](std::vector<uint8_t>& o, uint32_t f, const std::vector<uint8_t>& b) {
+    put_key(o, f, 2);
+    put_varint(o, b.size());
+    o.insert(o.end(), b.begin(), b.end());
+  };
+  auto frame = [](const std::vector<uint8_t>& p) {
+    std::vector<uint8_t> f = {static_cast<uint8_t>(p.size()), static_cast<uint8_t>(p.size() >> 8),
+                              static_cast<uint8_t>(p.size() >> 16), static_cast<uint8_t>(p.size() >> 24)};
+    f.insert(f.end(), p.begin(), p.end());
+    return f;
+  };
+  std::vector<uint8_t> gn;
+  put_sub(gn, 1, std::vector<uint8_t>{'C', 'A', 'R'});
+  std::string cu = "00000213-b2d1-43f0-9b88-960cebf8b91e";
+  put_sub(gn, 2, std::vector<uint8_t>(cu.begin(), cu.end()));
+  std::vector<uint8_t> payload(91, 0x5a);
+  put_sub(gn, 4, payload);
+  std::vector<uint8_t> ev, notif;
+  put_sub(ev, 4, gn);
+  put_sub(notif, 4, ev);
+  std::vector<uint8_t> resp, env;
+  put_sub(resp, 10, {});
+  put_key(env, 1, 0);
+  put_varint(env, 100);
+  put_sub(env, 3, resp);
+
+  int sv[2];
+  assert(::socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+  auto a = frame(notif), b = frame(env);
+  assert(::write(sv[1], a.data(), a.size()) == static_cast<ssize_t>(a.size()));
+  assert(::write(sv[1], b.data(), b.size()) == static_cast<ssize_t>(b.size()));
+  BridgeIpc ipc;
+  ipc.adopt_fd_for_test(sv[0]);
+  assert(ipc.gatt_write_uuid("CAR", "00000212-b2d1-43f0-9b88-960cebf8b91e", "", {1, 2, 3}, false));
+  assert(ipc.pending_notifications_for_test() == 1);
+  std::string got_cu;
+  std::vector<uint8_t> got;
+  assert(ipc.poll_gatt_notification(&got_cu, &got, 10, "car"));
+  assert(got_cu == cu && got.size() == 91);
+  assert(ipc.pending_notifications_for_test() == 0);
+  ::close(sv[1]);
+  printf("ok notification_during_write_is_queued\n");
+}
+
 int main() {
+  test_notification_during_write_is_queued();
   test_opcode_of();
   test_command_complete_shape();
   test_reset_and_bd_addr();

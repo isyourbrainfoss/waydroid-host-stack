@@ -3,6 +3,7 @@
 #pragma once
 
 #include <cstdint>
+#include <deque>
 #include <mutex>
 #include <string>
 #include <utility>
@@ -117,15 +118,30 @@ class BridgeIpc {
                                       std::vector<uint8_t>* value_out,
                                       std::string* device_id_out = nullptr);
 
+ // Test hook: take ownership of an already-connected stream fd.
+  void adopt_fd_for_test(int fd) { fd_ = fd; }
+  size_t pending_notifications_for_test() const { return pending_.size(); }
+
  private:
   bool write_all(const uint8_t* data, size_t len);
   bool read_exact(uint8_t* data, size_t len);
+  // Next non-notification frame. GattNotification events that arrive while a
+  // request waits for its Response are queued (not dropped) for
+  // poll_gatt_notification — e.g. Tesla VCSEC indicates the reply to a write
+  // before BlueZ reports the write complete.
   bool read_frame(std::vector<uint8_t>& payload);
+  bool read_frame_raw(std::vector<uint8_t>& payload);
   bool write_frame(const std::vector<uint8_t>& payload);
 
   // Close socket; caller must already hold io_mu_ (non-recursive).
   void close_locked();
 
+  struct PendingNotification {
+    std::string device_id;
+    std::string char_uuid;
+    std::vector<uint8_t> value;
+  };
+  std::deque<PendingNotification> pending_;
   int fd_ = -1;
   uint64_t next_rid_ = 100;
   // Serialize request/response and notify poll on the same unix fd.

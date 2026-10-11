@@ -5,7 +5,7 @@
 #   sudo sh scripts/do-root-install.sh [ARTIFACTS_DIR]   full install + checks
 #   sudo sh scripts/do-root-install.sh --diag            diagnostics only
 #   sudo sh scripts/do-root-install.sh --microg          host daemon update + microG (Waydroid running)
-#   sudo sh scripts/do-root-install.sh --update-host     swap waydroid-bt-host only (restart daemon)
+#   sudo sh scripts/do-root-install.sh --update-host     swap waydroid-bt-host and/or Soft HCI HAL if changed
 #   sudo sh scripts/do-root-install.sh --fix-bt          BT perms + toggle + diag (Waydroid running)
 #
 # Always ends with a guest diagnostic dump (~<user>/waydroid-bt-diag-*.txt) and
@@ -89,6 +89,28 @@ if [ "$MODE" = microg ] || [ "$MODE" = updatehost ]; then
 		systemctl is-active waydroid-bt-host
 	fi
 	if [ "$MODE" = updatehost ]; then
+		HAL_NEW="$ART/hal/android.hardware.bluetooth@1.0-service.waydroid"
+		HAL_CUR=/var/lib/waydroid/overlay/system/bin/hw/android.hardware.bluetooth@1.0-service.waydroid
+		if ! cmp -s "$HAL_NEW" "$HAL_CUR"; then
+			STEP="Soft HCI HAL update"
+			"$SBINDIR/waydroid-install-soft-hci-hal.sh" "$HAL_NEW"
+			STEP="restart Waydroid for new HAL"
+			as_user waydroid session stop 2>/dev/null || true
+			systemctl restart waydroid-container
+			sleep 2
+			systemctl start waydroid-run-xdg.service || true
+			as_user systemd-run --user --collect --unit="waydroid-session-updatehal-$$" waydroid session start
+			i=0
+			boot=""
+			while [ "$i" -lt 150 ]; do
+				boot=$(timeout 5 waydroid shell getprop sys.boot_completed 2>/dev/null | tr -d '\r\n\t ' || true)
+				[ "$boot" = 1 ] && break
+				i=$((i + 3)); sleep 3
+			done
+			[ "$boot" = 1 ] || { echo "guest did not boot within 150s"; exit 1; }
+			sleep 10
+			echo "HAL_UPDATED; guest booted after ~${i}s; bt_state: $(timeout 15 waydroid shell dumpsys bluetooth_manager 2>/dev/null | sed -n 's/^ *state: *//p' | head -n1)"
+		fi
 		STEP=finished
 		echo "DO_ROOT_UPDATE_HOST_OK ($(sha256sum "$BINDIR/waydroid-bt-host" | cut -c1-12))"
 		exit 0
