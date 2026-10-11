@@ -87,6 +87,11 @@ if ! grep -q 'prefers stale last-known over city-level live' "$ROOT/scripts/wayd
   echo "MISSING stale+city-level pick_fix selftest in gps forwarder"
   fail=1
 fi
+# seed-from-host must pass --force/--force-coarse through (#11)
+if ! grep -q 'seed-from-host) seed_from_host "\$@"' "$ROOT/scripts/waydroid-gps-forward.sh"; then
+  echo "FAIL seed-from-host drops its arguments"
+  fail=1
+fi
 # pull-field-session must resolve remote HOME (not desk $HOME) for scp
 if ! grep -q 'REMOTE_HOME=' "$ROOT/scripts/pull-field-session.sh"; then
   echo "MISSING REMOTE_HOME resolution in pull-field-session"
