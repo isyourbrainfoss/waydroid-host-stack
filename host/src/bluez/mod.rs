@@ -353,7 +353,12 @@ impl BlueZ {
         let ch = self
             .find_characteristic(device_id, service_uuid, char_uuid)
             .await?;
+        let mtu = ch.mtu().await.unwrap_or(0);
+        if mtu != 0 && value.len() + 3 > mtu as usize {
+            debug!(%device_id, %char_uuid, len = value.len(), mtu, "write exceeds ATT MTU — BlueZ uses long (prepared) write");
+        }
         ch.write(value).await.context("gatt write")?;
+        debug!(%device_id, %char_uuid, mtu, "gatt write done");
         Ok(())
     }
 
@@ -366,6 +371,8 @@ impl BlueZ {
         let ch = self
             .find_characteristic(device_id, service_uuid, char_uuid)
             .await?;
+        let mtu = ch.mtu().await.unwrap_or(0);
+        info!(%device_id, %char_uuid, att_mtu = mtu, "enabling notify/indicate");
         let stream = ch.notify().await.context("enable notify")?;
         Ok(stream)
     }

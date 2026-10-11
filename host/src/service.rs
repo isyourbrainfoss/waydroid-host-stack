@@ -391,7 +391,15 @@ impl BridgeService {
                         );
                         let handle = tokio::spawn(async move {
                             futures::pin_mut!(stream);
+                            let mut n: u64 = 0;
                             while let Some(value) = stream.next().await {
+                                n += 1;
+                                // Low-rate GATT (e.g. Tesla VCSEC) logs every value;
+                                // high-rate sensors log the first few then every 200th.
+                                if n <= 20 || n % 200 == 0 {
+                                    info!(%device_id, %char_uuid, n, len = value.len(),
+                                          "gatt inbound value");
+                                }
                                 let env = event_envelope(event::Payload::GattNotification(
                                     GattNotificationEvent {
                                         device_id: device_id.clone(),
