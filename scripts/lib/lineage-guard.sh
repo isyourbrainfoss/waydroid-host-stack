@@ -10,8 +10,43 @@
 #
 # Override (at your own risk): WAYDROID_BT_SKIP_VERSION_GUARD=1
 # Change targets: WAYDROID_BT_REQUIRED_SDK=33 WAYDROID_BT_REQUIRED_BUILD_PREFIX=TQ3A
+#
+# Image location: $WAYDROID_SYSTEM_IMG if set, else images_path from
+# Waydroid's config ($WAYDROID_CFG, default /var/lib/waydroid/waydroid.cfg;
+# e.g. BengalOS keeps images in /home/waydroid/images), else the classic
+# /var/lib/waydroid/images/system.img.
 
-: "${WAYDROID_SYSTEM_IMG:=/var/lib/waydroid/images/system.img}"
+# whs_waydroid_images_path -> images directory Waydroid actually uses.
+whs_waydroid_images_path() {
+	cfg="${WAYDROID_CFG:-/var/lib/waydroid/waydroid.cfg}"
+	if [ -r "$cfg" ]; then
+		p=$(sed -n '/^\[waydroid\]/,/^\[/{s/^[[:space:]]*images_path[[:space:]]*=[[:space:]]*//p;}' "$cfg" |
+			head -n1 | sed 's/[[:space:]]*$//')
+		if [ -n "$p" ]; then
+			echo "$p"
+			return 0
+		fi
+	fi
+	echo /var/lib/waydroid/images
+}
+
+# whs_waydroid_system_img -> path of system.img (honours WAYDROID_SYSTEM_IMG).
+whs_waydroid_system_img() {
+	if [ -n "${WAYDROID_SYSTEM_IMG:-}" ]; then
+		echo "$WAYDROID_SYSTEM_IMG"
+		return 0
+	fi
+	d=$(whs_waydroid_images_path)
+	if [ -f "$d/system.img" ]; then
+		echo "$d/system.img"
+	elif [ -f /var/lib/waydroid/images/system.img ]; then
+		echo /var/lib/waydroid/images/system.img
+	else
+		echo "$d/system.img"
+	fi
+}
+
+WAYDROID_SYSTEM_IMG=$(whs_waydroid_system_img)
 : "${WAYDROID_BT_REQUIRED_SDK:=33}"
 : "${WAYDROID_BT_REQUIRED_BUILD_PREFIX:=TQ3A}"
 

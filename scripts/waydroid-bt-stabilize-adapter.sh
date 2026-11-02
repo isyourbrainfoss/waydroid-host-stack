@@ -20,7 +20,6 @@ set -eu
 
 OVERLAY="${WAYDROID_OVERLAY:-/var/lib/waydroid/overlay}"
 APEX_LIB="$OVERLAY/system/apex/com.android.btservices/lib64/libbluetooth_jni.so"
-IMG="${WAYDROID_SYSTEM_IMG:-/var/lib/waydroid/images/system.img}"
 SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 PATCH_PY="$SCRIPT_DIR/waydroid-patch-bt-jni-timerfd.py"
 # Prefer the std-only Rust patcher (no python3 on image-based hosts).
@@ -31,6 +30,9 @@ LIBDIR="${WHS_LIBDIR:-$SCRIPT_DIR/lib}"
 # shellcheck source=scripts/lib/lineage-guard.sh
 . "$LIBDIR/lineage-guard.sh"
 whs_resolve_paths
+# system.img: $WAYDROID_SYSTEM_IMG, else images_path from waydroid.cfg, else
+# /var/lib/waydroid/images (lineage-guard.sh resolves it).
+IMG="$WAYDROID_SYSTEM_IMG"
 PATCH_BIN="${WAYDROID_BT_JNI_PATCH:-}"
 if [ -z "$PATCH_BIN" ]; then
 	PATCH_BIN=$(command -v waydroid-bt-jni-patch 2>/dev/null || whs_find_helper waydroid-bt-jni-patch || true)

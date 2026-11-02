@@ -230,7 +230,7 @@ sudo waydroid shell dumpsys bluetooth_manager
 
 What it does:
 
-0. Refuses unless the image is Lineage 20 / Android 13 (SDK 33, build id `TQ3A*`), read from `system.img` via `debugfs` (`scripts/lib/lineage-guard.sh`; override `WAYDROID_BT_SKIP_VERSION_GUARD=1`). `waydroid-restore-bluetooth-apk.sh` has the same guard.
+0. Refuses unless the image is Lineage 20 / Android 13 (SDK 33, build id `TQ3A*`), read from `system.img` via `debugfs` (`scripts/lib/lineage-guard.sh`; the image is found via `images_path` in `/var/lib/waydroid/waydroid.cfg`, falling back to `/var/lib/waydroid/images`, or set `WAYDROID_SYSTEM_IMG`; override `WAYDROID_BT_SKIP_VERSION_GUARD=1`). `waydroid-restore-bluetooth-apk.sh` has the same guard.
 1. Patches overlay `libbluetooth_jni.so` with `waydroid-bt-jni-patch` (Rust, no python3; the `.py` is a desk fallback) — three AArch64 sites `mov w0,#9` → `#7` (BOOTTIME).
 2. Seeds/appends `ro.bluetooth.ble_start_timeout_delay=86400000` on overlay `system/build.prop`.
 
