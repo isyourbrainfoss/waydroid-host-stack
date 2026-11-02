@@ -53,7 +53,16 @@ Optional sysext instead of `/var/lib/waydroid-host-stack`:
 ```sh
 sh scripts/build-sysext.sh                    # out/waydroid-host-stack.raw (or dir)
 sudo sh scripts/install-host-system.sh --sysext out/waydroid-host-stack.raw
+sudo reboot                                   # systemd-sysext.service merges it at boot
+sudo sh scripts/install-host-system.sh --sysext-activate   # enable + start units
 ```
+
+By default `--sysext` does **not** run `systemd-sysext refresh`: a refresh
+unmerges and re-merges every extension, so anything running from another
+sysext (on BengalOS, Waydroid itself ships as one) sees `/usr` change under it.
+The extension is only staged in `/var/lib/extensions` (plus `/etc` fragments)
+and merged at the next boot. `--refresh` opts into merging immediately and
+prints the extensions it will re-merge.
 
 Unsigned extensions are rejected if the image enforces a signed sysext image
 policy; use the default install in that case. A sysext pinned with

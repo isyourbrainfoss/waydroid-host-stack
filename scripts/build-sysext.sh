@@ -6,7 +6,10 @@
 # Output: $OUT/waydroid-host-stack.raw (squashfs/erofs) or $OUT/waydroid-host-stack/ (dir).
 # Install on the phone:
 #   sudo sh scripts/install-host-system.sh --sysext waydroid-host-stack.raw
-# which copies it to /var/lib/extensions/ and runs `systemd-sysext refresh`.
+# which copies it to /var/lib/extensions/ (merged at the next boot), then after
+# the reboot: sudo sh scripts/install-host-system.sh --sysext-activate.
+# --refresh merges immediately via `systemd-sysext refresh`, which re-merges
+# every extension and disrupts ones in use (opt-in).
 #
 # extension-release defaults to ID=_any (works across OS versions). Pass
 # --id nura --level 26100602 to pin it to one image build (must match

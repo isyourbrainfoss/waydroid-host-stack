@@ -19,6 +19,12 @@
 #   sh scripts/install-host-system.sh --print-paths
 #   sh scripts/install-host-system.sh --uninstall
 #   sh scripts/install-host-system.sh --sysext FILE.raw|DIR   # see build-sysext.sh
+#       stages the extension in /var/lib/extensions and /etc only; it is merged
+#       at the next boot by systemd-sysext.service. Then run --sysext-activate.
+#       Add --refresh to merge now with `systemd-sysext refresh`, which
+#       unmerges and re-merges EVERY extension (/usr briefly changes under
+#       anything running from another sysext, e.g. Waydroid on BengalOS).
+#   sh scripts/install-host-system.sh --sysext-activate        # after that boot
 #   DESTDIR=/tmp/stage sh scripts/install-host-system.sh --stage-only   # packaging
 #
 # Paths: see scripts/lib/paths.sh (PREFIX, BINDIR, SBINDIR, LIBEXECDIR, UNITDIR,
@@ -36,6 +42,7 @@ ENABLE=1
 MODE=install
 BIN_DIR=""
 SYSEXT_SRC=""
+REFRESH=0
 DESTDIR="${DESTDIR:-}"
 
 while [ $# -gt 0 ]; do
@@ -47,7 +54,9 @@ while [ $# -gt 0 ]; do
 	--stage-only) MODE=stage ;;
 	--bin-dir) shift; BIN_DIR="$1" ;;
 	--sysext) shift; SYSEXT_SRC="$1"; MODE=sysext ;;
-	-h | --help) sed -n '2,27p' "$0"; exit 0 ;;
+	--refresh) REFRESH=1 ;;
+	--sysext-activate) MODE=sysext_activate ;;
+	-h | --help) sed -n '2,31p' "$0"; exit 0 ;;
 	*) echo "unknown arg: $1" >&2; exit 2 ;;
 	esac
 	shift
@@ -244,9 +253,33 @@ sysext)
 	BINDIR=/usr/bin SBINDIR=/usr/libexec/waydroid-host-stack UNITDIR=/usr/lib/systemd/system
 	run mkdir -p /var/lib/extensions
 	run cp -a "$SYSEXT_SRC" /var/lib/extensions/
-	run systemd-sysext refresh
-	run systemd-sysext status
 	DESTDIR="" stage_etc
+	if [ "$REFRESH" = 1 ]; then
+		echo "WARNING: systemd-sysext refresh unmerges and re-merges ALL extensions:"
+		systemd-sysext list 2>/dev/null | sed 's/^/  /' || true
+		echo "  processes running from another extension's /usr (e.g. Waydroid) may"
+		echo "  break until restarted. Prefer the default (merge at next boot)."
+		run systemd-sysext refresh
+		run systemd-sysext status
+		activate
+		echo "SYSEXT_INSTALL_OK"
+	else
+		if ! systemctl is-enabled --quiet systemd-sysext.service 2>/dev/null; then
+			echo "WARN: systemd-sysext.service is not enabled; the extension will not be merged at boot" >&2
+		fi
+		echo "SYSEXT_STAGED $(basename "$SYSEXT_SRC") in /var/lib/extensions (not merged now:"
+		echo "  'systemd-sysext refresh' would re-merge every running extension)."
+		echo "Reboot, then: sudo sh $0 --sysext-activate"
+		echo "(or re-run with --refresh to merge immediately)"
+	fi
+	;;
+sysext_activate)
+	check_device
+	BINDIR=/usr/bin SBINDIR=/usr/libexec/waydroid-host-stack UNITDIR=/usr/lib/systemd/system
+	if [ ! -x "$BINDIR/waydroid-bt-host" ] || [ ! -f "$UNITDIR/waydroid-bt-host.service" ]; then
+		echo "waydroid-host-stack extension is not merged yet ($BINDIR/waydroid-bt-host missing); reboot first" >&2
+		exit 1
+	fi
 	activate
 	echo "SYSEXT_INSTALL_OK"
 	;;
