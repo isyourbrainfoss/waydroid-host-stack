@@ -50,7 +50,7 @@ Docs: [architecture](docs/architecture.md) · [phone-ready](docs/phone-ready.md)
 | `scripts/` | Forwarders, boot recovery, field pull |
 | `tests/` | Desk selftests + golden Phone Key fixture |
 | `docs/` | Architecture and day-of notes |
-| `devices/` | Per-device config (fajita, enchilada, generic) |
+| `devices/` | Per-device config (fajita, enchilada, Fairphone 5, generic) |
 | `packaging/systemd/` | Root units (LXC include, /run/xdg bind) |
 
 ```bash

@@ -116,8 +116,10 @@ Stock images **strip Bluetooth packages**. Build a custom image with patches fro
 
 Per-device settings live in `devices/<codename>.conf` (firmware list, NFC,
 half-boot fix, package manager). `scripts/setup-pmos.sh` auto-detects the
-device (`IMAGE_ID`, `/etc/deviceinfo`, device-tree) — override `WHS_DEVICE=`.
-Shipped: `oneplus-fajita`, `oneplus-enchilada`, `generic`.
+device (`IMAGE_ID`, `/etc/deviceinfo`, device-tree; the first one with a
+config wins, so an image-based distro's `IMAGE_ID` does not hide the device) —
+override `WHS_DEVICE=`.
+Shipped: `oneplus-fajita`, `oneplus-enchilada`, `fairphone-fp5`, `generic`.
 
 ### OnePlus 6T (`oneplus-fajita`) — working baseline
 
