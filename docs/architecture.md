@@ -59,6 +59,8 @@ Stock Fluoride/Gabeldorsche expects `IBluetoothHci` and then runs **its own L2CA
 | Power on/off | Host BlueZ is truth. Guest “off” → **soft-disable** (guest sees off; radio stays up). `force_host` optional for explicit BlueZ power. |
 | Address / privacy | One identity from BlueZ |
 | Bonds | Stored in BlueZ |
+| Pairing agent | `waydroid-bt-host` never registers as BlueZ's default agent, so the desktop agent (Phosh, GNOME, bluetui) keeps handling host pairing. A temporary, non-default Just-Works agent exists only while Android runs `CreateBond`, and is dropped afterwards. |
+| Pairable | Off while idle: the bridge switches the adapter's `Pairable` off at start and after each guest bond, and on only for the duration of a guest `CreateBond`. To pair a host accessory, switch it on in the desktop UI or `bluetoothctl pairable on`. Opt out with `--keep-host-pairable` / `WAYDROID_BT_KEEP_HOST_PAIRABLE=1`. |
 | Discovery | Refcounted sessions (host UI + guest) |
 | Kill Waydroid | Host BT unaffected; sessions cleared |
 | Kill BlueZ | Guest sees adapter unavailable |

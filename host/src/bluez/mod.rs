@@ -25,15 +25,26 @@ pub struct BlueZ {
 }
 
 struct BlueZInner {
-    _session: Session,
-    /// Keep pairing agent registered for Just-Works / auto-confirm bonds.
-    _agent: AgentHandle,
+    session: Session,
+    /// Leave the host adapter non-pairable while no guest bond is running.
+    idle_pairable_off: bool,
+    /// Serialises guest CreateBond so the pairing window cannot overlap.
+    bond_lock: Mutex<()>,
     adapter: RwLock<Option<Adapter>>,
     power: PowerPolicy,
     /// device_id (address string) -> open device handle
     devices: Mutex<HashMap<String, Device>>,
     #[allow(dead_code)]
     adapter_events: broadcast::Sender<AdapterInfo>,
+}
+
+async fn set_pairable_logged(adapter: &Adapter, on: bool, why: &str) {
+    match adapter.set_pairable(on).await {
+        Ok(()) => info!(pairable = on, reason = why, "host adapter Pairable set"),
+        Err(e) => {
+            warn!(pairable = on, reason = why, error = %e, "could not set host adapter Pairable")
+        }
+    }
 }
 
 fn bluer_transport(name: DiscoveryTransportName) -> DiscoveryTransport {
@@ -45,21 +56,16 @@ fn bluer_transport(name: DiscoveryTransportName) -> DiscoveryTransport {
 }
 
 impl BlueZ {
-    pub async fn connect(power: PowerPolicy) -> Result<Self> {
+    pub async fn connect(power: PowerPolicy, idle_pairable_off: bool) -> Result<Self> {
         let session = Session::new()
             .await
             .context("connect to BlueZ session (is bluetoothd running?)")?;
-        // NoInputNoOutput default agent accepts Just-Works; request_default so
-        // CreateBond does not hang waiting for an interactive host agent.
-        let agent = Agent {
-            request_default: true,
-            ..Default::default()
-        };
-        let agent_handle = session
-            .register_agent(agent)
-            .await
-            .context("register BlueZ pairing agent")?;
-        info!("BlueZ pairing agent registered (default, Just-Works capable)");
+        // No permanent or default agent. Registering a NoInputNoOutput agent
+        // as BlueZ's default would push the desktop agent (Phosh, GNOME, ...)
+        // aside and make the host accept Just-Works pairing from anyone in
+        // range. A non-default agent is registered only for the duration of a
+        // guest CreateBond (see create_bond).
+        info!("BlueZ pairing agent: on-demand only, never default");
 
         let adapter = session
             .default_adapter()
@@ -67,12 +73,16 @@ impl BlueZ {
             .context("no default Bluetooth adapter")?;
         let adapter_name = adapter.name().to_string();
         info!(adapter = %adapter_name, "BlueZ adapter opened");
+        if idle_pairable_off {
+            set_pairable_logged(&adapter, false, "idle").await;
+        }
 
         let (tx, _) = broadcast::channel(64);
         Ok(Self {
             inner: Arc::new(BlueZInner {
-                _session: session,
-                _agent: agent_handle,
+                session,
+                idle_pairable_off,
+                bond_lock: Mutex::new(()),
                 adapter: RwLock::new(Some(adapter)),
                 power,
                 devices: Mutex::new(HashMap::new()),
@@ -378,16 +388,42 @@ impl BlueZ {
     }
 
     pub async fn create_bond(&self, address: &str) -> Result<BondState> {
+        let _bond = self.inner.bond_lock.lock().await;
         // Device object must exist in BlueZ (scan/discover first).
         self.ensure_device_known(address, Duration::from_secs(15))
             .await
             .context("device not known for bonding")?;
         let device = self.device_for_address(address).await?;
-        info!(%address, "CreateBond: connecting then pair()");
+        let adapter = self.adapter().await?;
+        info!(%address, "CreateBond: opening pairing window, connecting then pair()");
+        // Temporary, non-default agent owned by this process: BlueZ uses the
+        // agent of the D-Bus client that calls Pair(), so the guest's bond is
+        // Just-Works while every other pairing request still goes to the
+        // desktop's default agent. Unregistered when the handle drops.
+        let agent: AgentHandle = self
+            .inner
+            .session
+            .register_agent(Agent {
+                request_default: false,
+                ..Default::default()
+            })
+            .await
+            .context("register temporary pairing agent")?;
+        // The kernel only sets SMP's bonding flag (stores keys) when the
+        // adapter is bondable, so open it for this pair() only.
+        let was_pairable = adapter.is_pairable().await.unwrap_or(false);
+        if !was_pairable {
+            set_pairable_logged(&adapter, true, "guest bond").await;
+        }
         // Best-effort connect before pair (some LE devices require it).
         let _ = tokio::time::timeout(Duration::from_secs(20), device.connect()).await;
-        tokio::time::timeout(Duration::from_secs(45), device.pair())
-            .await
+        let result = tokio::time::timeout(Duration::from_secs(45), device.pair()).await;
+        // Close the pairing window whatever the outcome.
+        drop(agent);
+        if self.inner.idle_pairable_off || !was_pairable {
+            set_pairable_logged(&adapter, false, "bond finished").await;
+        }
+        result
             .map_err(|_| anyhow!("pair timeout"))?
             .context("pair device")?;
         let paired = device.is_paired().await.unwrap_or(false);
