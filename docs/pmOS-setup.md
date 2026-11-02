@@ -233,6 +233,15 @@ What it does:
 0. Refuses unless the image is Lineage 20 / Android 13 (SDK 33, build id `TQ3A*`), read from `system.img` via `debugfs` (`scripts/lib/lineage-guard.sh`; the image is found via `images_path` in `/var/lib/waydroid/waydroid.cfg`, falling back to `/var/lib/waydroid/images`, or set `WAYDROID_SYSTEM_IMG`; override `WAYDROID_BT_SKIP_VERSION_GUARD=1`). `waydroid-restore-bluetooth-apk.sh` has the same guard.
 1. Patches overlay `libbluetooth_jni.so` with `waydroid-bt-jni-patch` (Rust, no python3; the `.py` is a desk fallback) — three AArch64 sites `mov w0,#9` → `#7` (BOOTTIME).
 2. Seeds/appends `ro.bluetooth.ble_start_timeout_delay=86400000` on overlay `system/build.prop`.
+   Waydroid overlays whole files, so this is a full copy of the image's
+   `build.prop` (a props-only file would drop every other system prop). The copy
+   is tied to the image: the sha256 and fingerprint of the image's `build.prop`
+   are kept in `/var/lib/waydroid-host-stack/state/build-prop.src`, and
+   `waydroid-container.service` runs `waydroid-bt-stabilize-adapter.sh --resync`
+   before every start (it only touches a copy this script seeded). After a Waydroid OTA the copy is re-seeded from the new
+   image (old copy kept as `build.prop.whs-old`); if the new image fails the
+   version guard the copy is moved to `build.prop.whs-disabled` so the image's
+   own `build.prop` applies. `--check` reports `BUILD_PROP_STALE` without changing anything.
 
 **Hard next step for Android app BLE:** complete Alternative E so `bringUpBle` finishes (minimal HCI HAL **or** BlueZ-backed binder backend). Adapter may remain `BLE_TURNING_ON` until then; host BlueZ must stay sole radio owner.
 

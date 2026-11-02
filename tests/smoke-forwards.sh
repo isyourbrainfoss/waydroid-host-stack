@@ -19,6 +19,10 @@ echo "=== waydroid-uid selftest ==="
 if ! sh "$ROOT/tests/waydroid-uid-selftest.sh"; then
   fail=1
 fi
+echo "=== stabilize build.prop selftest ==="
+if ! sh "$ROOT/tests/stabilize-build-prop-selftest.sh"; then
+  fail=1
+fi
 echo "=== nfc-forward selftest ==="
 if ! sh "$ROOT/tests/nfc-forward-selftest.sh"; then
   fail=1
