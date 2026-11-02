@@ -74,11 +74,10 @@ if [ "$MODE" != stage ] && [ "$DRY" = 0 ] && [ "$(id -u)" -ne 0 ]; then
 	exit 1
 fi
 
+# waydroid.prop host.uid, SUDO_UID, running session owner, logind (lib/paths.sh).
 waydroid_uid() {
-	uid=$(sed -n 's/^waydroid.host.uid=//p' /var/lib/waydroid/waydroid.prop 2>/dev/null | head -n1)
-	[ -n "$uid" ] || uid="${SUDO_UID:-}"
-	[ -n "$uid" ] || uid=1000
-	echo "$uid"
+	[ -n "${_WHS_WD_UID:-}" ] || _WHS_WD_UID=$(whs_waydroid_uid)
+	echo "$_WHS_WD_UID"
 }
 
 # Locate built binaries: --bin-dir, aarch64 musl cross build, native release.
@@ -96,6 +95,7 @@ find_bin() {
 
 subst() {
 	# subst SRC DEST — rewrite placeholders/paths for this layout.
+	[ -n "${_WHS_WD_UID:-}" ] || _WHS_WD_UID=$(whs_waydroid_uid)
 	run mkdir -p "$(dirname "$2")"
 	if [ "$DRY" = 1 ]; then
 		echo "DRY: render $1 -> $2"

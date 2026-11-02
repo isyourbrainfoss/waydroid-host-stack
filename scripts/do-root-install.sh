@@ -30,7 +30,15 @@ case "${1:-}" in
 --update-host) MODE=updatehost; shift ;;
 esac
 ART="${1:-$ROOT/artifacts}"
-U="${SUDO_USER:-${DOAS_USER:-kb}}"
+# shellcheck source=lib/paths.sh
+. "$ROOT/scripts/lib/paths.sh"
+# The Waydroid user: $WHS_USER, sudo/doas caller, else derived from
+# waydroid.prop / the running session / logind (whs_waydroid_uid).
+U="${WHS_USER:-${SUDO_USER:-${DOAS_USER:-}}}"
+if [ -z "$U" ] || [ "$U" = root ]; then
+	U=$(getent passwd "$(whs_waydroid_uid)" | cut -d: -f1)
+fi
+[ -n "$U" ] || { echo "cannot determine the Waydroid user; set WHS_USER" >&2; exit 1; }
 UHOME=$(getent passwd "$U" | cut -d: -f6)
 UID_N=$(id -u "$U")
 LOG="${WHS_LOG:-$UHOME/waydroid-root-install.log}"

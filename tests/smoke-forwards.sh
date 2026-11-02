@@ -15,6 +15,10 @@ echo "=== lineage-guard selftest ==="
 if ! sh "$ROOT/tests/lineage-guard-selftest.sh"; then
   fail=1
 fi
+echo "=== waydroid-uid selftest ==="
+if ! sh "$ROOT/tests/waydroid-uid-selftest.sh"; then
+  fail=1
+fi
 echo "=== nfc-forward selftest ==="
 if ! sh "$ROOT/tests/nfc-forward-selftest.sh"; then
   fail=1
