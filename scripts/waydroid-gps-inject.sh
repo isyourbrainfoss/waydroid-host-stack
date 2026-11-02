@@ -5,9 +5,11 @@
 #
 # Cheap by design: polls a file's content every $INTERVAL s, only touches the
 # container (lxc-attach, no python waydroid CLI) when the fix changed or every
-# $KEEPALIVE s, and sets up providers once per container boot.
+# $KEEPALIVE s, and sets up providers once per container boot: as soon as
+# Android reports sys.boot_completed, even before the first host fix, so apps
+# and `dumpsys location` see the gps/network test providers right away.
 #
-#   waydroid-gps-inject.sh [loop|once|thaw-once|status]
+#   waydroid-gps-inject.sh [loop|once|thaw-once|setup|status]
 set -eu
 
 FIX="${WAYDROID_GPS_FIX:-/run/waydroid-host-stack/gps-fix}"
@@ -16,6 +18,8 @@ LXC_PATH="${WAYDROID_LXC_PATH:-/var/lib/waydroid/lxc}"
 INTERVAL="${GPS_INJECT_INTERVAL:-2}"
 KEEPALIVE="${GPS_INJECT_KEEPALIVE:-30}"
 MAX_AGE="${GPS_INJECT_MAX_AGE:-600}"
+# How often to retry provider setup while Android is still booting.
+SETUP_RETRY="${GPS_INJECT_SETUP_RETRY:-10}"
 mkdir -p "$STATE"
 
 log() { echo "$(date -u +%H:%M:%SZ) $*"; }
@@ -60,15 +64,10 @@ inject() {
 # Validate numbers so nothing odd reaches the guest shell.
 valid_num() { case "$1" in '' | *[!0-9.+-]*) return 1 ;; esac; }
 
-once() {
-	[ -s "$FIX" ] || { log "no host fix yet ($FIX)"; return 1; }
-	IFS='|' read -r lat lon acc _alt _spd _hdg ts _desc <"$FIX" || return 1
-	valid_num "$lat" && valid_num "$lon" || { log "bad fix line"; return 1; }
-	valid_num "$acc" || acc=50
-	now=$(date +%s)
-	if [ -n "${ts:-}" ] && [ $((now - ts)) -gt "$MAX_AGE" ]; then
-		log "host fix stale ($((now - ts))s) — injecting last known anyway"
-	fi
+# ensure_setup: register the test providers once per container boot.
+# Returns 0 when the providers exist, 1 if the container is not running,
+# frozen, or Android has not finished booting yet.
+ensure_setup() {
 	pid=$(container_pid) || { rm -f "$STATE/setup-pid"; return 1; }
 	# Frozen = Android suspended by Waydroid; attaching would hang. Retry later.
 	cst=$(whs_container_state)
@@ -78,12 +77,23 @@ once() {
 		return 1
 	fi
 	echo RUNNING >"$STATE/last-cstate"
-	if [ "$(cat "$STATE/setup-pid" 2>/dev/null)" != "$pid" ]; then
-		guest_booted || return 1
-		setup_providers || { log "provider setup failed"; return 1; }
-		echo "$pid" >"$STATE/setup-pid"
-		log "providers ready (container pid=$pid)"
+	[ "$(cat "$STATE/setup-pid" 2>/dev/null)" = "$pid" ] && return 0
+	guest_booted || return 1
+	setup_providers || { log "provider setup failed"; return 1; }
+	echo "$pid" >"$STATE/setup-pid"
+	log "providers ready (container pid=$pid)"
+}
+
+once() {
+	[ -s "$FIX" ] || { log "no host fix yet ($FIX)"; return 1; }
+	IFS='|' read -r lat lon acc _alt _spd _hdg ts _desc <"$FIX" || return 1
+	valid_num "$lat" && valid_num "$lon" || { log "bad fix line"; return 1; }
+	valid_num "$acc" || acc=50
+	now=$(date +%s)
+	if [ -n "${ts:-}" ] && [ $((now - ts)) -gt "$MAX_AGE" ]; then
+		log "host fix stale ($((now - ts))s) — injecting last known anyway"
 	fi
+	ensure_setup || return 1
 	if inject "$lat" "$lon" "$acc"; then
 		echo "$lat|$lon|$acc" >"$STATE/last"
 		date +%s >"$STATE/last-ts"
@@ -98,6 +108,7 @@ loop() {
 	last=""
 	last_t=0
 	ok_logged=""
+	setup_t=0
 	while :; do
 		cur=$(cut -d'|' -f1-3 "$FIX" 2>/dev/null || true)
 		# Re-inject promptly after a thaw (Android may have missed updates).
@@ -106,6 +117,11 @@ loop() {
 			last_t=0
 		fi
 		now=$(date +%s)
+		# No fix yet: still create the providers as soon as Android is up.
+		if [ -z "$cur" ] && [ $((now - setup_t)) -ge "$SETUP_RETRY" ]; then
+			ensure_setup || true
+			setup_t=$now
+		fi
 		if [ -n "$cur" ] && { [ "$cur" != "$last" ] || [ $((now - last_t)) -ge "$KEEPALIVE" ]; }; then
 			if once; then
 				[ "$cur" = "$ok_logged" ] || log "INJECT_OK $cur"
@@ -122,9 +138,10 @@ case "${1:-loop}" in
 loop) loop ;;
 once) once && echo "GPS_INJECT_OK $(cat "$STATE/last")" ;;
 thaw-once) whs_container_thaw; once && echo "GPS_INJECT_OK $(cat "$STATE/last")" ;;
+setup) ensure_setup && echo GPS_SETUP_OK ;;
 status)
 	echo "fix: $(cat "$FIX" 2>/dev/null || echo none)"
 	echo "last_inject: $(cat "$STATE/last" 2>/dev/null || echo none) at $(cat "$STATE/last-ts" 2>/dev/null || echo -)"
 	;;
-*) echo "usage: $0 [loop|once|thaw-once|status]" >&2; exit 2 ;;
+*) echo "usage: $0 [loop|once|thaw-once|setup|status]" >&2; exit 2 ;;
 esac

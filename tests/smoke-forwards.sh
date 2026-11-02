@@ -7,6 +7,10 @@ echo "=== gps-forward selftest ==="
 if ! sh "$ROOT/tests/gps-forward-selftest.sh"; then
   fail=1
 fi
+echo "=== gps-inject selftest ==="
+if ! sh "$ROOT/tests/gps-inject-selftest.sh"; then
+  fail=1
+fi
 echo "=== nfc-forward selftest ==="
 if ! sh "$ROOT/tests/nfc-forward-selftest.sh"; then
   fail=1

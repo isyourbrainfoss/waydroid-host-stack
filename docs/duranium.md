@@ -88,7 +88,10 @@ GeoClue reader, which image-based hosts lack):
   `mmcli -m any --location-enable-gps-nmea` is set), else WiFi/IP via BeaconDB.
 - `waydroid-gps-inject.service` — `waydroid-gps-inject.sh loop` injects that fix
   into the guest's `gps`/`network` test providers via `lxc-attach` only when it
-  changes (keepalive 30 s); no python `waydroid` CLI per tick.
+  changes (keepalive 30 s); no python `waydroid` CLI per tick. The test
+  providers are created as soon as Android has booted (`sys.boot_completed`),
+  before the first host fix, so apps see `gps`/`network` right away
+  (`waydroid-gps-inject.sh setup` does this step by hand).
 
 The user loop idles automatically while the root injector is active.
 
