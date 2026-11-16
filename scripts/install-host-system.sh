@@ -123,7 +123,7 @@ UNITS="waydroid-bt-host.service waydroid-bt-inject.service waydroid-bt-inject.ti
 waydroid-bt-lxc-include.service waydroid-bt-lxc-include.path
 waydroid-run-xdg.service waydroid-run-xdg.path
 waydroid-geoclue-fix.service waydroid-gps-inject.service"
-SBIN_SCRIPTS="waydroid-bt-inject-socket.sh waydroid-bt-session-hook.sh
+SBIN_SCRIPTS="waydroid-bt-inject-socket.sh waydroid-bt-session-hook.sh waydroid-bt-session-restart.sh
 waydroid-guest-bt-probe.sh waydroid-bt-apply-lxc-include.sh waydroid-run-xdg-bind.sh
 waydroid-bt-stabilize-adapter.sh waydroid-restore-bluetooth-apk.sh
 waydroid-patch-bt-jni-timerfd.py waydroid-install-soft-hci-hal.sh
