@@ -34,6 +34,12 @@ struct Args {
     /// Skip BlueZ connection (IPC only; for protocol smoke tests).
     #[arg(long, default_value_t = false)]
     dry_run: bool,
+
+    /// Do not touch the host adapter's Pairable flag while idle. By default the
+    /// bridge switches Pairable off at start and after every guest bond; it is
+    /// only switched on while Android is actively bonding a device.
+    #[arg(long, env = "WAYDROID_BT_KEEP_HOST_PAIRABLE", default_value_t = false)]
+    keep_host_pairable: bool,
 }
 
 #[tokio::main]
@@ -63,7 +69,7 @@ async fn main() -> Result<()> {
         // Connect may fail without adapter — only used when not dry_run.
         return run_dry(args.socket, scan, version).await;
     } else {
-        BlueZ::connect(power)
+        BlueZ::connect(power, !args.keep_host_pairable)
             .await
             .context("BlueZ connect failed — is bluetooth.service running?")?
     };

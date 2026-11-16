@@ -7,6 +7,22 @@ echo "=== gps-forward selftest ==="
 if ! sh "$ROOT/tests/gps-forward-selftest.sh"; then
   fail=1
 fi
+echo "=== gps-inject selftest ==="
+if ! sh "$ROOT/tests/gps-inject-selftest.sh"; then
+  fail=1
+fi
+echo "=== lineage-guard selftest ==="
+if ! sh "$ROOT/tests/lineage-guard-selftest.sh"; then
+  fail=1
+fi
+echo "=== waydroid-uid selftest ==="
+if ! sh "$ROOT/tests/waydroid-uid-selftest.sh"; then
+  fail=1
+fi
+echo "=== stabilize build.prop selftest ==="
+if ! sh "$ROOT/tests/stabilize-build-prop-selftest.sh"; then
+  fail=1
+fi
 echo "=== nfc-forward selftest ==="
 if ! sh "$ROOT/tests/nfc-forward-selftest.sh"; then
   fail=1
@@ -25,6 +41,10 @@ if ! sh "$ROOT/scripts/phone-key-ready.sh" --selftest; then
 fi
 echo "=== force-normal-boot selftest ==="
 if ! sh "$ROOT/scripts/waydroid-force-normal-boot.sh" --selftest; then
+  fail=1
+fi
+echo "=== bt-host session-restart selftest ==="
+if ! sh "$ROOT/tests/session-restart-selftest.sh"; then
   fail=1
 fi
 echo "=== golden Phone Key fixture (pull --local) ==="
@@ -69,6 +89,11 @@ fi
 # City-level live must not beat stale last-known (selftest case in shipped script)
 if ! grep -q 'prefers stale last-known over city-level live' "$ROOT/scripts/waydroid-gps-forward.sh"; then
   echo "MISSING stale+city-level pick_fix selftest in gps forwarder"
+  fail=1
+fi
+# seed-from-host must pass --force/--force-coarse through (#11)
+if ! grep -q 'seed-from-host) seed_from_host "\$@"' "$ROOT/scripts/waydroid-gps-forward.sh"; then
+  echo "FAIL seed-from-host drops its arguments"
   fail=1
 fi
 # pull-field-session must resolve remote HOME (not desk $HOME) for scp

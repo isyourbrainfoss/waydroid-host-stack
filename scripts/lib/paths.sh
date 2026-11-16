@@ -87,3 +87,64 @@ whs_find_helper() {
 	done
 	return 1
 }
+
+# _whs_uid_ok UID -> 0 for a real (non-root, numeric) login uid.
+_whs_uid_ok() {
+	case "$1" in '' | 0 | *[!0-9]*) return 1 ;; esac
+	return 0
+}
+
+# whs_waydroid_uid -> uid of the user who runs the Waydroid session.
+# Order: waydroid.host.uid in waydroid.prop, $WAYDROID_UID, SUDO_UID/DOAS_USER,
+# owner of a running `waydroid session`, owner of the active logind
+# (graphical) session, the only /run/user/<uid> present, then 1000.
+whs_waydroid_uid() {
+	prop="${WAYDROID_PROP:-/var/lib/waydroid/waydroid.prop}"
+	uid=$(sed -n 's/^waydroid.host.uid=//p' "$prop" 2>/dev/null | head -n1 | tr -d '[:space:]')
+	_whs_uid_ok "$uid" && { echo "$uid"; return 0; }
+	uid="${WAYDROID_UID:-}"
+	_whs_uid_ok "$uid" && { echo "$uid"; return 0; }
+	uid="${SUDO_UID:-}"
+	_whs_uid_ok "$uid" && { echo "$uid"; return 0; }
+	if [ -n "${DOAS_USER:-}" ]; then
+		uid=$(id -u "$DOAS_USER" 2>/dev/null || true)
+		_whs_uid_ok "$uid" && { echo "$uid"; return 0; }
+	fi
+	# Running session: the `waydroid session start` (or -w) process belongs
+	# to the session user.
+	if command -v pgrep >/dev/null 2>&1; then
+		for pid in $(pgrep -f 'waydroid.* session start' 2>/dev/null || true); do
+			uid=$(awk '/^Uid:/{print $2}' "/proc/$pid/status" 2>/dev/null || true)
+			_whs_uid_ok "$uid" && { echo "$uid"; return 0; }
+		done
+	fi
+	# logind: owner of the active session (prefer wayland/x11 on a seat).
+	if command -v loginctl >/dev/null 2>&1; then
+		best=""
+		for sid in $(loginctl list-sessions --no-legend 2>/dev/null | awk '{print $1}'); do
+			info=$(loginctl show-session "$sid" -p User -p Type -p Active -p Class 2>/dev/null || true)
+			u=$(printf '%s\n' "$info" | sed -n 's/^User=//p')
+			_whs_uid_ok "$u" || continue
+			printf '%s\n' "$info" | grep -q '^Class=user$' || continue
+			if printf '%s\n' "$info" | grep -q '^Active=yes$' &&
+				printf '%s\n' "$info" | grep -qE '^Type=(wayland|x11)$'; then
+				echo "$u"
+				return 0
+			fi
+			[ -n "$best" ] || best=$u
+		done
+		_whs_uid_ok "$best" && { echo "$best"; return 0; }
+	fi
+	# Exactly one user runtime dir (single-user phone).
+	n=0
+	for d in /run/user/[0-9]*; do
+		[ -d "$d" ] || continue
+		u=${d##*/}
+		_whs_uid_ok "$u" || continue
+		n=$((n + 1))
+		uid=$u
+	done
+	[ "$n" -eq 1 ] && { echo "$uid"; return 0; }
+	echo "WARN: could not determine the Waydroid user; assuming uid 1000 (set WAYDROID_UID)" >&2
+	echo 1000
+}

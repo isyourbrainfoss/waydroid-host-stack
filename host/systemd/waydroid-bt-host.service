@@ -9,6 +9,14 @@ Type=simple
 # Installers rewrite this path to $BINDIR (image-based default:
 # /var/lib/waydroid-host-stack/bin). Distro packages / sysext keep /usr/bin.
 ExecStart=/usr/bin/waydroid-bt-host --socket /run/waydroid-bt/host.sock
+# If a Waydroid session was already running before this bridge instance
+# started (manual restart / crash restart), restart the session user unit so
+# the guest reconnects to the new bridge. Skips at boot/first start; debounced.
+# "-": never fails the bridge; "+": runs outside the sandbox below (needs
+# systemctl --user -M). Installers rewrite @SBINDIR@.
+# WHS_USER: rendered at install (empty -> helper resolves via lib/paths.sh).
+Environment=WHS_USER=@WAYDROID_USER@
+ExecStartPost=-+@SBINDIR@/waydroid-bt-session-restart.sh
 Restart=on-failure
 RestartSec=2
 # /run/waydroid-bt is bind-mounted into the Waydroid container. Keep the

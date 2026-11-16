@@ -16,7 +16,10 @@ use waydroid_bt_protocol::{
     GattCharacteristic, GattDescriptor, GattService,
 };
 
-use crate::discovery::{guest_pair_discovery_transport, DiscoveryTransportName};
+use crate::discovery::{
+    connect_scan_budget_from, guest_pair_discovery_transport, is_retryable_connect_error,
+    peer_presence, DiscoveryTransportName, PeerPresence, CONNECT_SCAN_SECS_ENV,
+};
 use crate::policy::{PowerPolicy, ScanPolicy};
 
 #[derive(Clone)]
@@ -25,15 +28,26 @@ pub struct BlueZ {
 }
 
 struct BlueZInner {
-    _session: Session,
-    /// Keep pairing agent registered for Just-Works / auto-confirm bonds.
-    _agent: AgentHandle,
+    session: Session,
+    /// Leave the host adapter non-pairable while no guest bond is running.
+    idle_pairable_off: bool,
+    /// Serialises guest CreateBond so the pairing window cannot overlap.
+    bond_lock: Mutex<()>,
     adapter: RwLock<Option<Adapter>>,
     power: PowerPolicy,
     /// device_id (address string) -> open device handle
     devices: Mutex<HashMap<String, Device>>,
     #[allow(dead_code)]
     adapter_events: broadcast::Sender<AdapterInfo>,
+}
+
+async fn set_pairable_logged(adapter: &Adapter, on: bool, why: &str) {
+    match adapter.set_pairable(on).await {
+        Ok(()) => info!(pairable = on, reason = why, "host adapter Pairable set"),
+        Err(e) => {
+            warn!(pairable = on, reason = why, error = %e, "could not set host adapter Pairable")
+        }
+    }
 }
 
 fn bluer_transport(name: DiscoveryTransportName) -> DiscoveryTransport {
@@ -45,21 +59,16 @@ fn bluer_transport(name: DiscoveryTransportName) -> DiscoveryTransport {
 }
 
 impl BlueZ {
-    pub async fn connect(power: PowerPolicy) -> Result<Self> {
+    pub async fn connect(power: PowerPolicy, idle_pairable_off: bool) -> Result<Self> {
         let session = Session::new()
             .await
             .context("connect to BlueZ session (is bluetoothd running?)")?;
-        // NoInputNoOutput default agent accepts Just-Works; request_default so
-        // CreateBond does not hang waiting for an interactive host agent.
-        let agent = Agent {
-            request_default: true,
-            ..Default::default()
-        };
-        let agent_handle = session
-            .register_agent(agent)
-            .await
-            .context("register BlueZ pairing agent")?;
-        info!("BlueZ pairing agent registered (default, Just-Works capable)");
+        // No permanent or default agent. Registering a NoInputNoOutput agent
+        // as BlueZ's default would push the desktop agent (Phosh, GNOME, ...)
+        // aside and make the host accept Just-Works pairing from anyone in
+        // range. A non-default agent is registered only for the duration of a
+        // guest CreateBond (see create_bond).
+        info!("BlueZ pairing agent: on-demand only, never default");
 
         let adapter = session
             .default_adapter()
@@ -67,12 +76,16 @@ impl BlueZ {
             .context("no default Bluetooth adapter")?;
         let adapter_name = adapter.name().to_string();
         info!(adapter = %adapter_name, "BlueZ adapter opened");
+        if idle_pairable_off {
+            set_pairable_logged(&adapter, false, "idle").await;
+        }
 
         let (tx, _) = broadcast::channel(64);
         Ok(Self {
             inner: Arc::new(BlueZInner {
-                _session: session,
-                _agent: agent_handle,
+                session,
+                idle_pairable_off,
+                bond_lock: Mutex::new(()),
                 adapter: RwLock::new(Some(adapter)),
                 power,
                 devices: Mutex::new(HashMap::new()),
@@ -223,84 +236,152 @@ impl BlueZ {
         } else {
             Duration::from_millis(timeout_ms as u64)
         };
+        let scan_budget = connect_scan_budget_from(
+            timeout,
+            std::env::var(CONNECT_SCAN_SECS_ENV).ok().as_deref(),
+        );
 
-        // Ensure the device object exists (discovery may be required).
-        self.ensure_device_known(address, timeout.min(Duration::from_secs(12)))
-            .await?;
+        // Make sure BlueZ has a live Device object for the peer. Background
+        // reconnects (e.g. Tesla phone key) arrive with no guest scan running,
+        // so the temporary device object has usually expired: scan for it first.
+        self.ensure_device_known(address, scan_budget).await?;
 
         let device = self.device_for_address(address).await?;
-        // Already connected (guest reconnect / race after Soft HCI teardown): reuse.
-        if device.is_connected().await.unwrap_or(false) {
-            let id = address.to_uppercase();
-            self.inner
-                .devices
-                .lock()
-                .await
-                .insert(id.clone(), device);
-            info!(%id, "LE device already connected — reuse");
-            return Ok((id, 23u32));
-        }
-        debug!(%address, "connecting LE device");
-        tokio::time::timeout(timeout, device.connect())
-            .await
-            .map_err(|_| anyhow!("connect timeout"))?
-            .context("device.connect")?;
-
         let id = address.to_uppercase();
-        self.inner
-            .devices
-            .lock()
-            .await
-            .insert(id.clone(), device);
+        let mut retried = false;
+        loop {
+            // Already connected (guest reconnect / race after Soft HCI teardown): reuse.
+            if device.is_connected().await.unwrap_or(false) {
+                self.inner.devices.lock().await.insert(id.clone(), device);
+                info!(%id, "LE device already connected — reuse");
+                return Ok((id, 23u32));
+            }
+            debug!(%address, "connecting LE device");
+            match tokio::time::timeout(timeout, device.connect()).await {
+                Err(_) => return Err(anyhow!("connect timeout")),
+                Ok(Ok(())) => break,
+                Ok(Err(e)) => {
+                    let msg = e.to_string();
+                    if !retried && is_retryable_connect_error(&msg) {
+                        retried = true;
+                        warn!(%address, error = %msg, "connect_le: connect failed, rescanning and retrying once");
+                        tokio::time::sleep(Duration::from_millis(300)).await;
+                        self.ensure_device_known(address, scan_budget).await?;
+                        continue;
+                    }
+                    return Err(anyhow!("device.connect: {msg}"));
+                }
+            }
+        }
+
+        self.inner.devices.lock().await.insert(id.clone(), device);
         // MTU not always exposed via D-Bus; common LE default.
         let mtu = 23u32;
         info!(%id, mtu, "LE device connected");
         Ok((id, mtu))
     }
 
-    /// Start a short dual discovery so BlueZ creates the Device object for `address`.
+    /// Real BlueZ presence of `want`: `adapter.device()` alone always succeeds
+    /// (it only builds a D-Bus path), so check the object list and RSSI.
+    async fn presence(&self, adapter: &Adapter, want: Address) -> PeerPresence {
+        let exists = adapter
+            .device_addresses()
+            .await
+            .map(|v| v.contains(&want))
+            .unwrap_or(false);
+        let rssi = if exists {
+            match adapter.device(want) {
+                Ok(d) => d.rssi().await.ok().flatten(),
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+        peer_presence(exists, rssi)
+    }
+
+    /// Make sure BlueZ has a Device object for `address` that is currently
+    /// advertising. Fast path: already seen (RSSI) → return at once. Otherwise
+    /// join/start discovery (shared, ref-counted bluer session, so the guest
+    /// pair scan is not disturbed) until the peer shows up with RSSI or the
+    /// budget runs out. Discovery is released when the stream drops.
     async fn ensure_device_known(&self, address: &str, budget: Duration) -> Result<()> {
-        if self.device_for_address(address).await.is_ok() {
-            // Even if the object exists, it may be stale; still try a brief scan.
-        }
         let want: Address = address
             .parse()
             .map_err(|e| anyhow!("invalid address {address}: {e}"))?;
         let adapter = self.adapter().await?;
+        let initial = self.presence(&adapter, want).await;
+        if initial == PeerPresence::Seen {
+            debug!(%address, "connect_le: device recently seen, no scan");
+            return Ok(());
+        }
+        let started = tokio::time::Instant::now();
         let transport_name = guest_pair_discovery_transport();
+        info!(
+            %address,
+            state = ?initial,
+            budget_s = budget.as_secs_f32(),
+            transport = transport_name.as_bluez_str(),
+            "connect_le: device not seen, scanning"
+        );
         let filter = bluer::DiscoveryFilter {
             transport: bluer_transport(transport_name),
             ..Default::default()
         };
+        // Fails with DiscoveryActive while a guest scan runs; we then simply
+        // join that session (same transport).
         let _ = adapter.set_discovery_filter(filter).await;
-        let stream = adapter
-            .discover_devices()
-            .await
-            .context("discover_devices for connect")?;
-        pin_mut!(stream);
-        let deadline = tokio::time::Instant::now() + budget;
-        while tokio::time::Instant::now() < deadline {
-            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
-            match tokio::time::timeout(left.min(Duration::from_millis(500)), stream.next()).await {
-                Ok(Some(AdapterEvent::DeviceAdded(addr))) if addr == want => {
-                    info!(%address, "device seen in discovery");
-                    break;
-                }
-                Ok(Some(_)) => continue,
-                Ok(None) => break,
-                Err(_) => {
-                    // timeout tick — check if device object exists now
-                    if self.device_for_address(address).await.is_ok() {
+        // Owned (boxed) so the explicit drop below releases our discovery ref.
+        let mut stream = Box::pin(
+            adapter
+                .discover_devices_with_changes()
+                .await
+                .context("discover_devices for connect")?,
+        );
+        let deadline = started + budget;
+        loop {
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                break;
+            }
+            let left = deadline - now;
+            let check =
+                match tokio::time::timeout(left.min(Duration::from_millis(250)), stream.next())
+                    .await
+                {
+                    Ok(Some(AdapterEvent::DeviceAdded(addr))) => addr == want,
+                    Ok(Some(_)) => false,
+                    Ok(None) => {
+                        debug!(%address, "connect_le: discovery stream ended");
                         break;
                     }
-                }
+                    Err(_) => true, // tick
+                };
+            if check && self.presence(&adapter, want).await == PeerPresence::Seen {
+                info!(
+                    %address,
+                    after_s = format!("{:.1}", started.elapsed().as_secs_f32()),
+                    "connect_le: found after scan"
+                );
+                info!(%address, "device seen in discovery");
+                return Ok(());
             }
         }
-        // Final existence check
-        self.device_for_address(address)
-            .await
-            .map(|_| ())
-            .context("device not found after discovery")
+        drop(stream);
+        let waited = format!("{:.1}", started.elapsed().as_secs_f32());
+        match self.presence(&adapter, want).await {
+            PeerPresence::Seen => Ok(()),
+            PeerPresence::Stale => {
+                // Object exists (e.g. bonded) but no advert heard: let BlueZ try
+                // anyway, as before (kernel LE connect waits for an advert).
+                info!(%address, after_s = %waited, "connect_le: not heard in scan, trying known device object");
+                Ok(())
+            }
+            PeerPresence::Missing => {
+                info!(%address, after_s = %waited, "connect_le: device not found in scan");
+                Err(anyhow!("device not found after {waited}s scan"))
+            }
+        }
     }
 
     pub async fn disconnect(&self, device_id: &str) -> Result<()> {
@@ -378,16 +459,42 @@ impl BlueZ {
     }
 
     pub async fn create_bond(&self, address: &str) -> Result<BondState> {
+        let _bond = self.inner.bond_lock.lock().await;
         // Device object must exist in BlueZ (scan/discover first).
         self.ensure_device_known(address, Duration::from_secs(15))
             .await
             .context("device not known for bonding")?;
         let device = self.device_for_address(address).await?;
-        info!(%address, "CreateBond: connecting then pair()");
+        let adapter = self.adapter().await?;
+        info!(%address, "CreateBond: opening pairing window, connecting then pair()");
+        // Temporary, non-default agent owned by this process: BlueZ uses the
+        // agent of the D-Bus client that calls Pair(), so the guest's bond is
+        // Just-Works while every other pairing request still goes to the
+        // desktop's default agent. Unregistered when the handle drops.
+        let agent: AgentHandle = self
+            .inner
+            .session
+            .register_agent(Agent {
+                request_default: false,
+                ..Default::default()
+            })
+            .await
+            .context("register temporary pairing agent")?;
+        // The kernel only sets SMP's bonding flag (stores keys) when the
+        // adapter is bondable, so open it for this pair() only.
+        let was_pairable = adapter.is_pairable().await.unwrap_or(false);
+        if !was_pairable {
+            set_pairable_logged(&adapter, true, "guest bond").await;
+        }
         // Best-effort connect before pair (some LE devices require it).
         let _ = tokio::time::timeout(Duration::from_secs(20), device.connect()).await;
-        tokio::time::timeout(Duration::from_secs(45), device.pair())
-            .await
+        let result = tokio::time::timeout(Duration::from_secs(45), device.pair()).await;
+        // Close the pairing window whatever the outcome.
+        drop(agent);
+        if self.inner.idle_pairable_off || !was_pairable {
+            set_pairable_logged(&adapter, false, "bond finished").await;
+        }
+        result
             .map_err(|_| anyhow!("pair timeout"))?
             .context("pair device")?;
         let paired = device.is_paired().await.unwrap_or(false);

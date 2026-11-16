@@ -30,7 +30,15 @@ case "${1:-}" in
 --update-host) MODE=updatehost; shift ;;
 esac
 ART="${1:-$ROOT/artifacts}"
-U="${SUDO_USER:-${DOAS_USER:-kb}}"
+# shellcheck source=lib/paths.sh
+. "$ROOT/scripts/lib/paths.sh"
+# The Waydroid user: $WHS_USER, sudo/doas caller, else derived from
+# waydroid.prop / the running session / logind (whs_waydroid_uid).
+U="${WHS_USER:-${SUDO_USER:-${DOAS_USER:-}}}"
+if [ -z "$U" ] || [ "$U" = root ]; then
+	U=$(getent passwd "$(whs_waydroid_uid)" | cut -d: -f1)
+fi
+[ -n "$U" ] || { echo "cannot determine the Waydroid user; set WHS_USER" >&2; exit 1; }
 UHOME=$(getent passwd "$U" | cut -d: -f6)
 UID_N=$(id -u "$U")
 LOG="${WHS_LOG:-$UHOME/waydroid-root-install.log}"
@@ -216,26 +224,12 @@ else
 fi
 
 fi
-step "10/11 Android Bluetooth: grant runtime perms, then toggle once if stuck"
+step "10/11 Android Bluetooth: grant runtime perms, restart the Bluetooth app, toggle once if stuck"
 whs_container_thaw || true
 sh "$ROOT/scripts/waydroid-bt-grant-perms.sh" || PROBLEMS="$PROBLEMS bt-perms"
-# The Bluetooth process that booted without BLUETOOTH_CONNECT stays wedged in
-# BLE_TURNING_ON (USER_TURN_OFF/ON are "Unhandled" there), and granting does not
-# restart it. Kill it once; BluetoothManagerService rebinds and re-enables with
-# the new grants.
-if [ "$(bt_state)" != ON ]; then
-	old=$(gsh 'pidof com.android.bluetooth' | tr -d '\r\n')
-	echo "restarting com.android.bluetooth (pid ${old:-none}) to pick up grants"
-	[ -n "$old" ] && gsh "kill -9 $old" || true
-	i=0
-	while [ "$i" -lt 30 ]; do
-		new=$(gsh 'pidof com.android.bluetooth' | tr -d '\r\n')
-		[ -n "$new" ] && [ "$new" != "$old" ] && break
-		i=$((i + 2)); sleep 2
-	done
-	echo "com.android.bluetooth new pid=${new:-none} after ${i}s"
-	gsh 'cmd bluetooth_manager enable' || true
-fi
+# waydroid-bt-grant-perms.sh restarts com.android.bluetooth after granting:
+# the process that booted without BLUETOOTH_CONNECT stays wedged in
+# BLE_TURNING_ON and granting alone does not restart it.
 st=""
 i=0
 while [ "$i" -lt 30 ]; do
