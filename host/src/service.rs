@@ -248,8 +248,8 @@ impl BridgeService {
                         resp
                     }
                     Err(e) => {
-                        info!(error = %e, %addr, "connect_le failed");
-                        err_response(request_id, ErrorCode::Bluez, e.to_string())
+                        info!(error = %format!("{e:#}"), %addr, "connect_le failed");
+                        err_response(request_id, ErrorCode::Bluez, format!("{e:#}"))
                     }
                 }
             }
