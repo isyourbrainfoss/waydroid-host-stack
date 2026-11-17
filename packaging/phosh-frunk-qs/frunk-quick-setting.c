@@ -247,7 +247,9 @@ phosh_frunk_quick_setting_init (PhoshFrunkQuickSetting *self)
   phosh_status_icon_set_pixel_size (self->info, 16);
   phosh_status_icon_set_icon_name (self->info, ICON_NAME);
   gtk_widget_show (GTK_WIDGET (self->info));
-  phosh_quick_setting_set_status_icon (PHOSH_QUICK_SETTING (self), self->info);
+  /* phosh_quick_setting_set_status_icon() is not exported by the phosh binary;
+   * the "status-icon" property is what the upstream .ui templates use. */
+  g_object_set (self, "status-icon", self->info, NULL);
 
   g_signal_connect (self, "clicked", G_CALLBACK (on_clicked), NULL);
 
