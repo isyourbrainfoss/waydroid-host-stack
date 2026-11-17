@@ -1,0 +1,11 @@
+// DRAFT (not installed) -> /etc/polkit-1/rules.d/60-fp5-tesla-frunk.rules (root:root 0644)
+// Lets the local, active user fp5 START exactly tesla-frunk.service, nothing else.
+// No stop/restart, no other units, no run0, no remote (ssh) sessions.
+polkit.addRule(function(action, subject) {
+    if (action.id == "org.freedesktop.systemd1.manage-units" &&
+        action.lookup("unit") == "tesla-frunk.service" &&
+        action.lookup("verb") == "start" &&
+        subject.user == "fp5" && subject.local && subject.active) {
+        return polkit.Result.YES;
+    }
+});

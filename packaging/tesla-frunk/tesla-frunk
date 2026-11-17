@@ -1,0 +1,13 @@
+#!/bin/sh
+# Installed as /home/fp5/.local/bin/tesla-frunk (replaces the run0 version)
+# No password: polkit rule 60-fp5-tesla-frunk.rules allows only "start tesla-frunk.service".
+if systemctl start --no-ask-password tesla-frunk.service 2>/dev/null; then
+  notify-send -i car-symbolic "Frunk" "Open command sent"; exit 0
+fi
+rc=$(systemctl show -p ExecMainStatus --value tesla-frunk.service 2>/dev/null)
+case "$rc" in
+  3) notify-send -i dialog-error "Frunk" "Car not connected (phone key)";;
+  4) notify-send -i dialog-error "Frunk" "Waydroid is not running";;
+  *) notify-send -i dialog-error "Frunk" "Could not send command";;
+esac
+exit 1

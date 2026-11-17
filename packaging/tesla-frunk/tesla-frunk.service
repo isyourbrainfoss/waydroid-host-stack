@@ -1,0 +1,16 @@
+# Installed as /etc/systemd/system/tesla-frunk.service
+# Root-side of the "Open Frunk" launcher. Fixed command, no arguments from the user.
+# Fires the same intent as the Tesla notification's "Front Trunk" button
+# (PendingIntent requestCode=14 -> com.teslamotors.ble.action.COMMAND ->
+#  PhoneKeyCommandReceiver), but ONLY if that notification says "Connected".
+# Exit 0 = sent, 3 = car not connected, 4 = Waydroid not running, 5 = send failed.
+[Unit]
+Description=FP5: open Tesla frunk via Waydroid phone key (only when connected)
+StartLimitIntervalSec=30
+StartLimitBurst=3
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh /var/lib/fp5-tesla/bin/tesla-frunk-root.sh
+TimeoutStartSec=20
+SuccessExitStatus=0
