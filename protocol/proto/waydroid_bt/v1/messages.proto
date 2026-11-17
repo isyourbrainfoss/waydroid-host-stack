@@ -210,6 +210,12 @@ message AdvReportEvent {
 message ConnectLeRequest {
   BtAddress address = 1;
   uint32 timeout_ms = 2; // 0 = default
+  // Background connect for an absent peer: no active scan. The host arms the
+  // kernel LE auto-connect list (passive, low duty) and answers when the link
+  // is up, or with ERROR_CODE_TIMEOUT after timeout_ms (0 = 10 min). Answers
+  // ERROR_CODE_UNSUPPORTED when it cannot (caller falls back to active
+  // connects). Closing the socket cancels the wait and disarms.
+  bool wait_passive = 3;
 }
 
 message ConnectLeResponse {

@@ -95,6 +95,7 @@ async fn main() -> Result<()> {
                         address_type: 0,
                     }),
                     timeout_ms: args.connect_timeout_ms,
+                    wait_passive: false,
                 })),
             })),
         };

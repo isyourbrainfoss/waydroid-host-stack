@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Result;
 use bytes::Bytes;
@@ -14,7 +15,7 @@ use waydroid_bt_protocol::{
     GattReadResponse, PingResponse, PROTOCOL_MAJOR, PROTOCOL_MINOR,
 };
 
-use crate::bluez::BlueZ;
+use crate::bluez::{BlueZ, PassiveConnectError};
 use crate::policy::{ScanPolicy, ScanSession};
 
 pub struct BridgeService {
@@ -62,6 +63,32 @@ pub(crate) fn request_kind(env: &Envelope) -> RequestKind {
 /// attachment (pure).
 pub(crate) fn is_keepalive_name(name: &str) -> bool {
     name.ends_with("-keepalive")
+}
+
+/// Default / maximum passive wait for `ConnectLe { wait_passive }`.
+pub(crate) const PASSIVE_WAIT_DEFAULT_MS: u32 = 600_000;
+pub(crate) const PASSIVE_WAIT_MAX_MS: u32 = 1_800_000;
+
+/// Passive wait duration from the request timeout (pure).
+pub(crate) fn passive_wait(timeout_ms: u32) -> Duration {
+    let ms = match timeout_ms {
+        0 => PASSIVE_WAIT_DEFAULT_MS,
+        t => t.min(PASSIVE_WAIT_MAX_MS),
+    };
+    Duration::from_millis(ms as u64)
+}
+
+/// True for `ConnectLe { wait_passive: true }` (pure). Such a request may wait
+/// for minutes: the IPC loop watches the socket meanwhile (EOF cancels) and
+/// registers the event sink only afterwards, so a waiting client gets no scan
+/// or notification fan-out.
+pub(crate) fn is_passive_connect(env: &Envelope) -> bool {
+    match &env.body {
+        Some(envelope::Body::Request(r)) => {
+            matches!(&r.op, Some(request::Op::ConnectLe(c)) if c.wait_passive)
+        }
+        _ => false,
+    }
 }
 
 /// device_id from a successful ConnectLe response (pure).
@@ -350,7 +377,35 @@ impl BridgeService {
                     }
                 };
                 let address_msg = req.address.clone();
-                match self.bluez.connect_le(&addr, req.timeout_ms).await {
+                let result = if req.wait_passive {
+                    let proto_type = req.address.as_ref().map(|a| a.address_type).unwrap_or(0);
+                    match self
+                        .bluez
+                        .connect_le_passive(&addr, proto_type, passive_wait(req.timeout_ms))
+                        .await
+                    {
+                        Ok(v) => Ok(v),
+                        Err(PassiveConnectError::Timeout) => {
+                            return Ok(Some(err_response(
+                                request_id,
+                                ErrorCode::Timeout,
+                                "passive wait timeout (peer not in range)",
+                            )));
+                        }
+                        Err(PassiveConnectError::Unsupported(m)) => {
+                            warn!(error = %m, "connect_le: passive auto-connect unavailable");
+                            return Ok(Some(err_response(
+                                request_id,
+                                ErrorCode::Unsupported,
+                                format!("passive auto-connect unavailable: {m}"),
+                            )));
+                        }
+                        Err(PassiveConnectError::Other(e)) => Err(e),
+                    }
+                } else {
+                    self.bluez.connect_le(&addr, req.timeout_ms).await
+                };
+                match result {
                     Ok((device_id, mtu)) => {
                         // Emit ConnectionState *after* queuing the response path:
                         // best-effort only — a broken secondary client must not
@@ -753,6 +808,37 @@ mod tests {
         assert_eq!(request_kind(&dc), RequestKind::Disconnect("aa:bb:cc:dd:ee:01".into()));
         let empty = Envelope { request_id: 3, body: None };
         assert_eq!(request_kind(&empty), RequestKind::Other);
+    }
+
+    fn connect_env(wait_passive: bool) -> Envelope {
+        Envelope {
+            request_id: 4,
+            body: Some(envelope::Body::Request(waydroid_bt_protocol::Request {
+                op: Some(request::Op::ConnectLe(waydroid_bt_protocol::ConnectLeRequest {
+                    address: Some(BtAddress {
+                        address: "AA:BB:CC:DD:EE:01".into(),
+                        address_type: 1,
+                    }),
+                    timeout_ms: 0,
+                    wait_passive,
+                })),
+            })),
+        }
+    }
+
+    #[test]
+    fn passive_connect_is_detected() {
+        assert!(is_passive_connect(&connect_env(true)));
+        assert!(!is_passive_connect(&connect_env(false)));
+        assert!(!is_passive_connect(&ping_env("soft-hci-keepalive")));
+        assert_eq!(request_kind(&connect_env(true)), RequestKind::ConnectLe);
+    }
+
+    #[test]
+    fn passive_wait_default_and_cap() {
+        assert_eq!(passive_wait(0), Duration::from_millis(PASSIVE_WAIT_DEFAULT_MS as u64));
+        assert_eq!(passive_wait(90_000), Duration::from_secs(90));
+        assert_eq!(passive_wait(u32::MAX), Duration::from_millis(PASSIVE_WAIT_MAX_MS as u64));
     }
 
     #[test]

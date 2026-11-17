@@ -1255,6 +1255,7 @@ dependencies = [
  "clap",
  "dbus",
  "futures",
+ "libc",
  "prost",
  "serde",
  "tempfile",

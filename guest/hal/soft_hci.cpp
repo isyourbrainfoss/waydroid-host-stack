@@ -203,6 +203,22 @@ int SoftHci::pending_connect_retry_delay_ms(int attempt) {
   return 90000;
 }
 
+bool SoftHci::use_passive_wait(uint8_t filter_policy, int attempt, bool passive_unsupported) {
+  return filter_policy == 0x01 && attempt >= 2 && !passive_unsupported;
+}
+
+uint32_t SoftHci::passive_wait_ms(size_t accept_list_size) {
+  return accept_list_size <= 1 ? kPassiveWaitLongMs : kPassiveWaitShortMs;
+}
+
+int SoftHci::passive_rearm_delay_ms(int64_t waited_ms, uint32_t wait_ms, int early_failures) {
+  // Ran (almost) the whole wait: the host answered "timeout" -> re-arm now.
+  if (waited_ms + 2000 >= static_cast<int64_t>(wait_ms) || early_failures <= 0) return 0;
+  static const int kSteps[] = {2000, 5000, 10000, 30000, 60000};
+  const int n = static_cast<int>(sizeof(kSteps) / sizeof(kSteps[0]));
+  return kSteps[(early_failures > n ? n : early_failures) - 1];
+}
+
 uint64_t SoftHci::le_create_generation() const {
   std::lock_guard<std::mutex> lock(mu_);
   return le_create_gen_;

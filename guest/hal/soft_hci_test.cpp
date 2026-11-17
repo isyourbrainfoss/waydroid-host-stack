@@ -1126,6 +1126,116 @@ static void test_shutdown_io_aborts_inflight_connect() {
   printf("ok shutdown_io_aborts_inflight_connect (%lld ms)\n", static_cast<long long>(ms));
 }
 
+// Passive background connect policy (FP5 Tesla, BlueZ auto-connect).
+static void test_passive_wait_policy() {
+  // Background connect: first attempt active, then passive.
+  assert(!SoftHci::use_passive_wait(0x01, 1, false));
+  assert(SoftHci::use_passive_wait(0x01, 2, false));
+  assert(SoftHci::use_passive_wait(0x01, 50, false));
+  // Direct connects never wait passively; host without mgmt -> active.
+  assert(!SoftHci::use_passive_wait(0x00, 5, false));
+  assert(!SoftHci::use_passive_wait(0x01, 5, true));
+  assert(SoftHci::passive_wait_ms(0) == SoftHci::kPassiveWaitLongMs);
+  assert(SoftHci::passive_wait_ms(1) == SoftHci::kPassiveWaitLongMs);
+  assert(SoftHci::passive_wait_ms(2) == SoftHci::kPassiveWaitShortMs);
+  // Full wait (host "timeout") -> re-arm at once.
+  assert(SoftHci::passive_rearm_delay_ms(600000, 600000, 0) == 0);
+  assert(SoftHci::passive_rearm_delay_ms(599000, 600000, 1) == 0);
+  // Ended early (bridge restart / error) -> backoff, capped.
+  assert(SoftHci::passive_rearm_delay_ms(10, 600000, 1) == 2000);
+  assert(SoftHci::passive_rearm_delay_ms(10, 600000, 2) == 5000);
+  assert(SoftHci::passive_rearm_delay_ms(10, 600000, 5) == 60000);
+  assert(SoftHci::passive_rearm_delay_ms(10, 600000, 99) == 60000);
+  printf("ok passive_wait_policy\n");
+}
+
+namespace b55 {
+std::vector<uint8_t> err_response_code(uint64_t rid, uint64_t code) {
+  std::vector<uint8_t> resp, env;
+  key(resp, 1, 0);
+  auto e = varint(code);
+  resp.insert(resp.end(), e.begin(), e.end());
+  key(env, 1, 0);
+  auto r = varint(rid);
+  env.insert(env.end(), r.begin(), r.end());
+  sub(env, 3, resp);
+  return frame(env);
+}
+}  // namespace b55
+
+// ConnectLe { wait_passive=3 } and the address type go on the wire; the host
+// "timeout" / "unsupported" answers come back as error codes.
+static void test_passive_connect_wire_and_errors() {
+  auto enc = BridgeIpc::encode_connect_le(7, "02:00:00:00:00:01", 600000, true,
+                                          waydroid_bt::kProtoAddrRandom);
+  // Envelope payload after the 4-byte length prefix must contain
+  // BtAddress.address_type=2 (0x10 0x02) and ConnectLe.wait_passive=1 (0x18 0x01).
+  auto has = [&](std::initializer_list<uint8_t> pat) {
+    std::vector<uint8_t> p(pat);
+    return std::search(enc.begin(), enc.end(), p.begin(), p.end()) != enc.end();
+  };
+  assert(has({0x10, 0x02}));
+  assert(has({0x18, 0x01}));
+  auto plain = BridgeIpc::encode_connect_le(7, "02:00:00:00:00:01", 25000);
+  {
+    std::vector<uint8_t> p = {0x18, 0x01};
+    assert(std::search(plain.begin(), plain.end(), p.begin(), p.end()) == plain.end());
+  }
+
+  for (uint64_t code : {uint64_t{8}, uint64_t{7}}) {
+    int sv[2];
+    assert(::socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    std::thread host([&]() {
+      auto req = b55::read_frame(sv[1]);
+      assert(!req.empty());
+      std::vector<uint8_t> p = {0x18, 0x01};
+      assert(std::search(req.begin(), req.end(), p.begin(), p.end()) != req.end());
+      auto e = b55::err_response_code(100, code);
+      assert(::write(sv[1], e.data(), e.size()) == static_cast<ssize_t>(e.size()));
+    });
+    BridgeIpc ipc;
+    ipc.adopt_fd_for_test(sv[0]);
+    std::string dev, summary;
+    std::vector<std::pair<std::string, std::vector<BridgeIpc::GattChar>>> svcs;
+    uint32_t err = 0;
+    assert(!ipc.connect_le_open("02:00:00:00:00:01", 600000, &dev, &svcs, &summary, true,
+                                waydroid_bt::kProtoAddrPublic, &err));
+    assert(err == code);
+    assert(summary == (code == 8 ? "PASSIVE_TIMEOUT" : "PASSIVE_UNSUPPORTED"));
+    assert(ipc.connected());  // socket stays usable for the re-arm
+    host.join();
+    ::close(sv[1]);
+  }
+  uint32_t c = 99;
+  auto ok = b55::ping_response(5);
+  assert(BridgeIpc::parse_response_error(ok.data() + 4, ok.size() - 4, &c) && c == 0);
+  printf("ok passive_connect_wire_and_errors\n");
+}
+
+// Cancel during a long passive wait: shutdown_io still aborts at once.
+static void test_shutdown_io_aborts_passive_wait() {
+  int sv[2];
+  assert(::socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+  BridgeIpc ipc;
+  ipc.adopt_fd_for_test(sv[0]);
+  bool ok = true;
+  auto t0 = std::chrono::steady_clock::now();
+  std::thread att([&]() {
+    std::string dev, summary;
+    std::vector<std::pair<std::string, std::vector<BridgeIpc::GattChar>>> svcs;
+    ok = ipc.connect_le_open("02:00:00:00:00:01", 600000, &dev, &svcs, &summary, true);
+  });
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  ipc.shutdown_io();
+  att.join();
+  auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - t0)
+                .count();
+  assert(!ok && ms < 2000);
+  ::close(sv[1]);
+  printf("ok shutdown_io_aborts_passive_wait (%lld ms)\n", static_cast<long long>(ms));
+}
+
 // Long write (Prepare 0x16 x2 + Execute 0x18) must reach the host as ONE write
 // of the reassembled value (Tesla add-key 285 B at MTU 250 was dropped).
 static void test_prepared_long_write_reassembled() {
@@ -1230,6 +1340,9 @@ int main() {
   test_failed_connect_keeps_ipc_attached();
   test_keepalive_wait_and_detect_close();
   test_shutdown_io_aborts_inflight_connect();
+  test_passive_wait_policy();
+  test_passive_connect_wire_and_errors();
+  test_shutdown_io_aborts_passive_wait();
   printf("ALL_SOFT_HCI_TESTS_OK\n");
   return 0;
 }

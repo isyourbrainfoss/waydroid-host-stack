@@ -596,6 +596,7 @@ fn connect_le(
                         address_type: AddressType::Public as i32,
                     }),
                     timeout_ms,
+                    wait_passive: false,
                 })),
             })),
         },
@@ -1056,6 +1057,7 @@ mod tests {
                         address_type: AddressType::Public as i32,
                     }),
                     timeout_ms: 15000,
+                    wait_passive: false,
                 })),
             })),
         };

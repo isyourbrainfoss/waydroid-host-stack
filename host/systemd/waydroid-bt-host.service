@@ -26,9 +26,11 @@ RuntimeDirectory=waydroid-bt
 RuntimeDirectoryMode=0755
 RuntimeDirectoryPreserve=yes
 
-# Hardening. The daemon only talks to org.bluez over the D-Bus system bus
-# (bluer, "bluetoothd" feature) and serves a Unix socket: it opens no raw
-# HCI/L2CAP (AF_BLUETOOTH) or netlink sockets, so AF_UNIX is sufficient.
+# Hardening. The daemon talks to org.bluez over the D-Bus system bus
+# (bluer, "bluetoothd" feature) and serves a Unix socket. The only raw
+# Bluetooth socket is the kernel mgmt control channel (AF_BLUETOOTH, needs
+# CAP_NET_ADMIN) for passive LE auto-connect (host/src/bluez/mgmt.rs:
+# Add/Remove Device only). No HCI user channel, no L2CAP, no netlink.
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
@@ -37,7 +39,7 @@ ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true
 ReadWritePaths=/run/waydroid-bt
-RestrictAddressFamilies=AF_UNIX
+RestrictAddressFamilies=AF_UNIX AF_BLUETOOTH
 
 [Install]
 WantedBy=multi-user.target

@@ -12,7 +12,9 @@ use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 use waydroid_bt_protocol::{encode_frame, try_decode_frame, Envelope, MAX_FRAME_SIZE};
 
-use crate::service::{is_keepalive_name, request_kind, BridgeService, RequestKind};
+use crate::service::{
+    is_keepalive_name, is_passive_connect, request_kind, BridgeService, RequestKind,
+};
 
 /// Guest HAL keepalive connections currently attached (normally 0 or 1).
 static KEEPALIVE_CLIENTS: AtomicUsize = AtomicUsize::new(0);
@@ -139,7 +141,7 @@ async fn handle_client(
     let mut buf = BytesMut::with_capacity(4096);
     let mut tmp = vec![0u8; 8192];
     let result: Result<()> = async {
-        loop {
+        'outer: loop {
             let n = reader.read(&mut tmp).await?;
             if n == 0 {
                 break;
@@ -151,6 +153,7 @@ async fn handle_client(
             loop {
                 match try_decode_frame(&mut buf) {
                     Ok(Some(env)) => {
+                        let passive = is_passive_connect(&env);
                         match request_kind(&env) {
                             RequestKind::Ping(name) => {
                                 if !keepalive && is_keepalive_name(&name) {
@@ -162,19 +165,51 @@ async fn handle_client(
                                 }
                             }
                             _ => {
-                                if client_id.is_none() {
+                                // A passive wait may last minutes: register the
+                                // event sink only after it (no fan-out while
+                                // the client just waits).
+                                if client_id.is_none() && !passive {
                                     client_id =
                                         Some(service.register_event_sink(event_tx.clone()).await);
                                 }
                             }
                         }
                         // Handle requests sequentially for simpler device state.
-                        match service.handle_from(link_owner, env).await {
-                            Ok(Some(resp)) => {
+                        let handled = if passive {
+                            // Watch the socket while waiting: EOF (guest
+                            // cancelled LE Create Connection and shut the
+                            // socket down) drops the wait, which disarms the
+                            // kernel auto-connect entry.
+                            let fut = service.handle_from(link_owner, env);
+                            tokio::pin!(fut);
+                            let mut gone = false;
+                            let r = loop {
+                                tokio::select! {
+                                    r = &mut fut => break Some(r),
+                                    rd = reader.read(&mut tmp), if !gone => match rd {
+                                        Ok(0) | Err(_) => { gone = true; break None; }
+                                        Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                                    },
+                                }
+                            };
+                            if gone {
+                                info!("passive connect cancelled: guest client gone");
+                                break 'outer;
+                            }
+                            if client_id.is_none() {
+                                client_id =
+                                    Some(service.register_event_sink(event_tx.clone()).await);
+                            }
+                            r
+                        } else {
+                            Some(service.handle_from(link_owner, env).await)
+                        };
+                        match handled {
+                            Some(Ok(Some(resp))) => {
                                 write_envelope(&writer, &resp).await?;
                             }
-                            Ok(None) => {}
-                            Err(e) => {
+                            Some(Ok(None)) | None => {}
+                            Some(Err(e)) => {
                                 warn!(error = %e, "handler error");
                             }
                         }

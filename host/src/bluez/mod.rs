@@ -1,5 +1,7 @@
 //! BlueZ access via bluer (official Rust bindings).
 
+pub mod mgmt;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -22,6 +24,25 @@ use crate::discovery::{
     DiscoveryTransportName, PeerPresence, CONNECT_SCAN_SECS_ENV,
 };
 use crate::policy::{PowerPolicy, ScanPolicy};
+
+/// Re-check interval while waiting passively (missed D-Bus signal safety
+/// net; a D-Bus property read, not a scan).
+const PASSIVE_RECHECK: Duration = Duration::from_secs(30);
+/// After a kernel auto-connect, wait at most this long for GATT to resolve
+/// before taking the peer off the auto-connect list.
+const SERVICES_RESOLVED_WAIT: Duration = Duration::from_secs(10);
+
+#[derive(Debug, thiserror::Error)]
+pub enum PassiveConnectError {
+    /// No kernel mgmt access: caller should fall back to active connects.
+    #[error("passive auto-connect unsupported: {0}")]
+    Unsupported(String),
+    /// Peer did not show up within the wait (normal: car not in range).
+    #[error("passive wait timeout")]
+    Timeout,
+    #[error("{0:#}")]
+    Other(anyhow::Error),
+}
 
 #[derive(Clone)]
 pub struct BlueZ {
@@ -306,6 +327,149 @@ impl BlueZ {
         let mtu = 23u32;
         info!(%id, mtu, retries, "LE device connected");
         Ok((id, mtu))
+    }
+
+    /// Passive background connect ("car absent is normal").
+    ///
+    /// Instead of scanning actively, put the peer on the kernel LE
+    /// auto-connect list and wait up to `wait` for the kernel to connect it
+    /// (low-duty passive scan with the controller Filter Accept List, like an
+    /// Android controller does for `autoConnect`). The arm is removed again
+    /// when the link is up, on timeout, and when this future is dropped (the
+    /// guest cancelled and closed its socket).
+    pub async fn connect_le_passive(
+        &self,
+        address: &str,
+        proto_address_type: i32,
+        wait: Duration,
+    ) -> std::result::Result<(String, u32), PassiveConnectError> {
+        let want: Address = address
+            .parse()
+            .map_err(|e| PassiveConnectError::Other(anyhow!("invalid address {address}: {e}")))?;
+        let addr_le = mgmt::parse_bdaddr_le(address)
+            .ok_or_else(|| PassiveConnectError::Other(anyhow!("invalid address")))?;
+        let adapter = self.adapter().await.map_err(PassiveConnectError::Other)?;
+        let index = mgmt::hci_index_from_name(adapter.name())
+            .ok_or_else(|| PassiveConnectError::Unsupported("adapter index".into()))?;
+        let id = address.to_uppercase();
+
+        if let Some(dev) = self.connected_device(&adapter, want).await {
+            self.inner.devices.lock().await.insert(id.clone(), dev);
+            info!(%id, "LE device already connected — reuse");
+            return Ok((id, 23u32));
+        }
+
+        // Adapter events first, so a connect right after arming is not missed.
+        let mut adapter_events = Box::pin(
+            adapter
+                .events()
+                .await
+                .map_err(|e| PassiveConnectError::Other(anyhow!("adapter events: {e}")))?,
+        );
+        let addr_type = mgmt::mgmt_le_addr_type(proto_address_type);
+        let mut arm = tokio::task::spawn_blocking(move || {
+            mgmt::AutoConnectArm::arm(index, addr_le, addr_type)
+        })
+        .await
+        .map_err(|e| PassiveConnectError::Other(anyhow!("join: {e}")))?
+        .map_err(|e| match e {
+            mgmt::MgmtError::Unavailable(m) => PassiveConnectError::Unsupported(m),
+            other => PassiveConnectError::Other(anyhow!("{other}")),
+        })?;
+        info!(%address, wait_s = wait.as_secs(),
+              "connect_le: passive wait (kernel LE auto-connect armed, no active scan)");
+
+        let started = tokio::time::Instant::now();
+        let deadline = started + wait;
+        let connected = loop {
+            if let Some(dev) = self.connected_device(&adapter, want).await {
+                break dev;
+            }
+            // Device events for the existing object (Connected flips there).
+            let mut dev_events = match adapter.device(want) {
+                Ok(d) if adapter
+                    .device_addresses()
+                    .await
+                    .map(|v| v.contains(&want))
+                    .unwrap_or(false) =>
+                {
+                    d.events().await.ok().map(Box::pin)
+                }
+                _ => None,
+            };
+            if let Some(dev) = self.connected_device(&adapter, want).await {
+                break dev;
+            }
+            let dev_ev = async {
+                match dev_events.as_mut() {
+                    Some(s) => loop {
+                        match s.next().await {
+                            Some(bluer::DeviceEvent::PropertyChanged(
+                                bluer::DeviceProperty::Connected(true),
+                            )) => return,
+                            Some(_) => continue,
+                            None => futures::future::pending::<()>().await,
+                        }
+                    },
+                    None => futures::future::pending::<()>().await,
+                }
+            };
+            let ad_ev = async {
+                loop {
+                    match adapter_events.next().await {
+                        Some(AdapterEvent::DeviceAdded(a)) if a == want => return,
+                        Some(_) => continue,
+                        None => futures::future::pending::<()>().await,
+                    }
+                }
+            };
+            tokio::select! {
+                _ = tokio::time::sleep_until(deadline) => {
+                    arm.disarm();
+                    debug!(%address, "connect_le: passive wait timed out (peer absent)");
+                    return Err(PassiveConnectError::Timeout);
+                }
+                _ = dev_ev => {}
+                _ = ad_ev => {}
+                // Safety net only (missed signal); not a scan.
+                _ = tokio::time::sleep(PASSIVE_RECHECK) => {}
+            }
+        };
+        // Keep the kernel entry until bluetoothd's ATT bearer is up (GATT
+        // resolved): the kernel's auto-connect params hold a reference on the
+        // link, and dropping it before ATT holds one could let the idle link
+        // time out.
+        let resolved_by = tokio::time::Instant::now() + SERVICES_RESOLVED_WAIT;
+        while tokio::time::Instant::now() < resolved_by {
+            if connected.is_services_resolved().await.unwrap_or(false)
+                || !connected.is_connected().await.unwrap_or(false)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        arm.disarm();
+        info!(%id, after_s = format!("{:.1}", started.elapsed().as_secs_f32()),
+              "LE device connected (kernel auto-connect)");
+        self.inner.devices.lock().await.insert(id.clone(), connected);
+        Ok((id, 23u32))
+    }
+
+    async fn connected_device(&self, adapter: &Adapter, want: Address) -> Option<Device> {
+        let exists = adapter
+            .device_addresses()
+            .await
+            .map(|v| v.contains(&want))
+            .unwrap_or(false);
+        if !exists {
+            return None;
+        }
+        let d = adapter.device(want).ok()?;
+        if d.is_connected().await.unwrap_or(false) {
+            Some(d)
+        } else {
+            None
+        }
     }
 
     /// Real BlueZ presence of `want`: `adapter.device()` alone always succeeds

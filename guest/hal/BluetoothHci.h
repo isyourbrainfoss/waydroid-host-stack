@@ -61,7 +61,11 @@ struct BluetoothHci : public IBluetoothHci {
     uint64_t gen = 0;
     uint8_t filter_policy = 0;
   };
-  enum { kAttemptDone = 0, kAttemptFailed = 1, kAttemptStale = 2 };
+  // kAttemptUnsupported: the host cannot wait passively (no mgmt access);
+  // fall back to active retries for a while.
+  enum { kAttemptDone = 0, kAttemptFailed = 1, kAttemptStale = 2, kAttemptUnsupported = 3 };
+  // After kAttemptUnsupported, retry passive mode only after this long.
+  static constexpr int64_t kPassiveUnsupportedRetryMs = 30LL * 60 * 1000;
   static constexpr uint32_t kHostConnectAttemptMs = 25000;
 
   void eventWorker();
@@ -75,8 +79,11 @@ struct BluetoothHci : public IBluetoothHci {
   // One host connect + GATT open for attempt `gen`. kAttemptDone: completed
   // (success or a definitive status sent), kAttemptFailed: host link not up,
   // still pending, kAttemptStale: the stack cancelled meanwhile.
+  // passive_wait_ms > 0: ConnectLe wait_passive (host kernel auto-connect,
+  // no active scan) for up to that long.
   int attemptHostLeConnect(const uint8_t peer[6], uint8_t peer_type, uint64_t gen,
-                           bool first_attempt);
+                           bool first_attempt, uint32_t passive_wait_ms = 0);
+  bool passiveUnsupportedNow() const;
   void keepaliveWorker();
   void attNotifyWorker(uint16_t handle);
   // Close one session. inject_hci_disconnect=false when Soft HCI already emits
@@ -123,6 +130,9 @@ struct BluetoothHci : public IBluetoothHci {
   std::thread le_conn_thread_;
   // Socket of the host connect attempt in flight (shut down on Cancel/Reset).
   std::shared_ptr<waydroid_bt::BridgeIpc> le_inflight_ipc_;
+  // steady_clock ms until which passive waits are not tried (host said
+  // UNSUPPORTED). 0 = try.
+  std::atomic<int64_t> passive_unsupported_until_ms_{0};
 
   // Persistent ping-only attachment to the host bridge.
   std::mutex keepalive_mu_;

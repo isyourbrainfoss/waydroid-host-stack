@@ -96,6 +96,20 @@ class SoftHci {
   // then a battery-friendly steady state for a long background connect while
   // the peer is away: 2, 5, 10, 20, 30, 60, then 90 s.
   static int pending_connect_retry_delay_ms(int attempt);
+  // Background connect (policy 0x01) for an absent peer: after the first
+  // quick active attempt, hand the wait to the host kernel's passive LE
+  // auto-connect (ConnectLe wait_passive) instead of active-scan polling,
+  // unless the host said it cannot (passive_unsupported).
+  static bool use_passive_wait(uint8_t filter_policy, int attempt, bool passive_unsupported);
+  // Length of one passive wait. One peer: long (10 min, re-armed at once).
+  // Several accept-list peers: 60 s each so the round-robin keeps turning.
+  static uint32_t passive_wait_ms(size_t accept_list_size);
+  // Pause before re-arming after a passive wait ended without a link. 0 when
+  // the wait ran its course (peer simply absent); backoff when it ended early
+  // (bridge restart / error), early_failures counting consecutive early ends.
+  static int passive_rearm_delay_ms(int64_t waited_ms, uint32_t wait_ms, int early_failures);
+  static constexpr uint32_t kPassiveWaitLongMs = 600000;
+  static constexpr uint32_t kPassiveWaitShortMs = 60000;
   // Direct connects (policy 0x00) give up with 0x3E after this long without a
   // cancel from the stack (safety net; GD normally cancels after 30 s).
   static constexpr int kDirectConnectMaxMs = 60000;

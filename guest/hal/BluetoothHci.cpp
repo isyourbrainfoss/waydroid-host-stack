@@ -541,13 +541,17 @@ void BluetoothHci::leConnectWorker() {
     const auto started = std::chrono::steady_clock::now();
     suspendGapMs();  // reset baseline
     int attempt = 0;
+    bool first = true;
+    int passive_early = 0;  // consecutive passive waits that ended early
     size_t rr = 0;  // round-robin over the accept list for background connects
     while (!stop_.load() && soft_.le_create_pending_gen(p.gen)) {
       uint8_t target[6];
       uint8_t target_type = p.peer_type;
       std::memcpy(target, p.peer, 6);
+      size_t list_size = 0;
       if (p.filter_policy == 0x01) {
         auto list = soft_.accept_list_snapshot();
+        list_size = list.size();
         if (!list.empty()) {
           // Most recent entry first, then the others in turn.
           const auto& e = list[list.size() - 1 - (rr++ % list.size())];
@@ -556,7 +560,26 @@ void BluetoothHci::leConnectWorker() {
         }
       }
       attempt++;
-      const int r = attemptHostLeConnect(target, target_type, p.gen, attempt == 1);
+      // Background connect, peer absent after the first quick try: let the
+      // host kernel wait passively (LE auto-connect, low-duty passive scan)
+      // instead of polling with active scans. Still pending for the stack.
+      const bool passive =
+          waydroid_bt::SoftHci::use_passive_wait(p.filter_policy, attempt, passiveUnsupportedNow());
+      const uint32_t wait_ms = passive ? waydroid_bt::SoftHci::passive_wait_ms(list_size) : 0;
+      const auto attempt_started = std::chrono::steady_clock::now();
+      int r = attemptHostLeConnect(target, target_type, p.gen, first, wait_ms);
+      first = false;
+      if (r == kAttemptUnsupported) {
+        const int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                   std::chrono::steady_clock::now().time_since_epoch())
+                                   .count();
+        passive_unsupported_until_ms_.store(now_ms + kPassiveUnsupportedRetryMs);
+        ALOGW("Soft HCI LE pending connect gen=%llu: host cannot wait passively — "
+              "active retries for %lld min",
+              static_cast<unsigned long long>(p.gen),
+              static_cast<long long>(kPassiveUnsupportedRetryMs / 60000));
+        r = kAttemptFailed;
+      }
       if (r != kAttemptFailed) break;
       if (!soft_.le_create_pending_gen(p.gen)) break;
 
@@ -572,11 +595,25 @@ void BluetoothHci::leConnectWorker() {
         }
         break;
       }
-      int delay_ms = waydroid_bt::SoftHci::pending_connect_retry_delay_ms(attempt);
-      ALOGI("Soft HCI LE pending connect gen=%llu policy=%u attempt=%d: host link not up; "
-            "retry in %d s (still pending, nothing reported to the stack)",
-            static_cast<unsigned long long>(p.gen), static_cast<unsigned>(p.filter_policy),
-            attempt, delay_ms / 1000);
+      int delay_ms = 0;
+      if (passive) {
+        const int64_t waited_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                      std::chrono::steady_clock::now() - attempt_started)
+                                      .count();
+        passive_early = (waited_ms + 2000 >= static_cast<int64_t>(wait_ms)) ? 0 : passive_early + 1;
+        delay_ms = waydroid_bt::SoftHci::passive_rearm_delay_ms(waited_ms, wait_ms, passive_early);
+        ALOGI("Soft HCI LE pending connect gen=%llu: passive wait ended after %lld s without "
+              "link; re-arm in %d s (still pending, nothing reported to the stack)",
+              static_cast<unsigned long long>(p.gen), static_cast<long long>(waited_ms / 1000),
+              delay_ms / 1000);
+        if (delay_ms == 0) continue;
+      } else {
+        delay_ms = waydroid_bt::SoftHci::pending_connect_retry_delay_ms(attempt);
+        ALOGI("Soft HCI LE pending connect gen=%llu policy=%u attempt=%d: host link not up; "
+              "retry in %d s (still pending, nothing reported to the stack)",
+              static_cast<unsigned long long>(p.gen), static_cast<unsigned>(p.filter_policy),
+              attempt, delay_ms / 1000);
+      }
       // Wait in short slices so a resume from suspend (peer may now be in
       // range) or a cancel is noticed quickly.
       auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(delay_ms);
@@ -600,8 +637,17 @@ void BluetoothHci::leConnectWorker() {
   }
 }
 
+bool BluetoothHci::passiveUnsupportedNow() const {
+  const int64_t until = passive_unsupported_until_ms_.load();
+  if (until == 0) return false;
+  const int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                             std::chrono::steady_clock::now().time_since_epoch())
+                             .count();
+  return now_ms < until;
+}
+
 int BluetoothHci::attemptHostLeConnect(const uint8_t peer[6], uint8_t peer_type, uint64_t gen,
-                                       bool first_attempt) {
+                                       bool first_attempt, uint32_t passive_wait_ms) {
   // Format AA:BB:... from HCI LE byte order (little-endian of colon string).
   char addr_str[18];
   std::snprintf(addr_str, sizeof(addr_str), "%02X:%02X:%02X:%02X:%02X:%02X", peer[5], peer[4],
@@ -645,6 +691,7 @@ int BluetoothHci::attemptHostLeConnect(const uint8_t peer[6], uint8_t peer_type,
   std::string device_id;
   std::string summary;
   std::vector<std::pair<std::string, std::vector<waydroid_bt::BridgeIpc::GattChar>>> services;
+  uint32_t host_error = 0;
   const char* paths[] = {kBridgeSocket, kBridgeSocketAlt, nullptr};
   for (int i = 0; paths[i]; i++) {
     if (ipc->connect(paths[i])) {
@@ -657,10 +704,21 @@ int BluetoothHci::attemptHostLeConnect(const uint8_t peer[6], uint8_t peer_type,
       // Re-check after publishing: a Cancel that raced in before we stored
       // the pointer could not shut this socket down.
       if (soft_.le_create_pending_gen(gen)) {
-        // 25 s total on the host (scan + connect, one deadline): answers
-        // before GD's 30 s direct-connect timeout.
-        ok = ipc->connect_le_open(addr_str, kHostConnectAttemptMs, &device_id, &services,
-                                  &summary);
+        if (passive_wait_ms > 0) {
+          // Passive: host kernel LE auto-connect, no active scan; answers when
+          // the link is up or after passive_wait_ms (peer not in range).
+          ok = ipc->connect_le_open(addr_str, passive_wait_ms, &device_id, &services, &summary,
+                                    /*wait_passive=*/true,
+                                    peer_type == waydroid_bt::kHciAddrRandom
+                                        ? waydroid_bt::kProtoAddrRandom
+                                        : waydroid_bt::kProtoAddrPublic,
+                                    &host_error);
+        } else {
+          // 25 s total on the host (scan + connect, one deadline): answers
+          // before GD's 30 s direct-connect timeout.
+          ok = ipc->connect_le_open(addr_str, kHostConnectAttemptMs, &device_id, &services,
+                                    &summary);
+        }
       }
       {
         std::lock_guard<std::mutex> lock(le_conn_mu_);
@@ -670,6 +728,13 @@ int BluetoothHci::attemptHostLeConnect(const uint8_t peer[6], uint8_t peer_type,
     }
   }
   if (!ok) {
+    if (passive_wait_ms > 0 && host_error == waydroid_bt::kErrUnsupported) {
+      return kAttemptUnsupported;
+    }
+    if (passive_wait_ms > 0 && host_error == waydroid_bt::kErrTimeout) {
+      // Normal while the car is away; the worker re-arms.
+      return kAttemptFailed;
+    }
     // Car / peer absent or link setup failed: NOT reported to the stack. The
     // LE Create Connection stays pending (real-controller semantics) and the
     // worker retries; the stack decides when to give up (Cancel).

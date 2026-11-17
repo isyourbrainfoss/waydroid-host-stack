@@ -1,0 +1,10 @@
+# BlueZ LE passive-scan timing for kernel auto-connect (waydroid-host-stack
+# passive background connect). Same duty as an Android controller's
+# background connect (AOSP GD le_impl kScanIntervalSlow / kScanWindowSlow):
+# 30 ms listening every 1.28 s (~2.3 %). Units: 0.625 ms.
+# bluetoothd loads these into the kernel when the adapter is set up, so they
+# take effect at the next reboot (no bluetooth.service restart needed).
+# Without them the kernel default is 30 ms every 60 ms (~50 %).
+[LE]
+ScanIntervalAutoConnect=0x0800
+ScanWindowAutoConnect=0x0030

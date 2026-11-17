@@ -17,6 +17,10 @@ constexpr uint8_t kProtoAddrUnspecified = 0;
 constexpr uint8_t kProtoAddrPublic = 1;
 constexpr uint8_t kProtoAddrRandom = 2;
 
+// Host ErrorCode values (waydroid_bt.v1 messages.proto) the HAL acts on.
+constexpr uint32_t kErrUnsupported = 7;
+constexpr uint32_t kErrTimeout = 8;
+
 // HCI LE Advertising Report Address_Type (Core Spec Vol 4 Part E).
 constexpr uint8_t kHciAddrPublic = 0x00;
 constexpr uint8_t kHciAddrRandom = 0x01;
@@ -83,10 +87,17 @@ class BridgeIpc {
 
   // Connect + GATT discover; leaves host LE link open (no Disconnect).
   // Fills services tree for Soft HCI ATT cache. device_id is BlueZ address.
+  // wait_passive: background connect for an absent peer. The host arms the
+  // kernel LE auto-connect list (passive scan, no active scan) and answers
+  // when the link is up or after timeout_ms. *error_code_out gets the host
+  // ErrorCode on a ConnectLe failure (kErrTimeout: peer not in range,
+  // kErrUnsupported: host cannot wait passively -> use active connects).
   bool connect_le_open(const std::string& address_colon, uint32_t timeout_ms,
                        std::string* device_id_out,
                        std::vector<std::pair<std::string, std::vector<GattChar>>>* services_out,
-                       std::string* summary_out);
+                       std::string* summary_out, bool wait_passive = false,
+                       uint8_t proto_address_type = kProtoAddrPublic,
+                       uint32_t* error_code_out = nullptr);
   bool gatt_read_uuid(const std::string& device_id, const std::string& char_uuid,
                       const std::string& service_uuid, std::vector<uint8_t>* value_out);
   bool gatt_write_uuid(const std::string& device_id, const std::string& char_uuid,
@@ -107,7 +118,8 @@ class BridgeIpc {
   static std::vector<uint8_t> encode_start_le_scan(uint64_t request_id, bool active);
   static std::vector<uint8_t> encode_stop_le_scan(uint64_t request_id, uint32_t session_id);
   static std::vector<uint8_t> encode_connect_le(uint64_t request_id, const std::string& address,
-                                                uint32_t timeout_ms);
+                                                uint32_t timeout_ms, bool wait_passive = false,
+                                                uint8_t proto_address_type = kProtoAddrPublic);
   static std::vector<uint8_t> encode_gatt_discover(uint64_t request_id, const std::string& device_id);
   static std::vector<uint8_t> encode_gatt_read(uint64_t request_id, const std::string& device_id,
                                                const std::string& char_uuid,
@@ -118,6 +130,9 @@ class BridgeIpc {
   static bool parse_start_le_scan_session(const uint8_t* data, size_t len, uint32_t* session_out);
   static bool parse_adv_report(const uint8_t* data, size_t len, BridgeAdv* out);
   static bool parse_response_ok(const uint8_t* data, size_t len);
+  // Response.error (field 1) of an Envelope response; 0 when absent (OK).
+  // Returns false if the frame is not a response.
+  static bool parse_response_error(const uint8_t* data, size_t len, uint32_t* code_out);
   static bool parse_connect_le_device_id(const uint8_t* data, size_t len, std::string* device_id_out);
   static bool parse_gatt_discover_counts(const uint8_t* data, size_t len, size_t* services_out,
                                          size_t* chars_out);

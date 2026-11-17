@@ -521,20 +521,25 @@ bool BridgeIpc::poll_adv(BridgeAdv& out, int timeout_ms) {
 }
 
 std::vector<uint8_t> BridgeIpc::encode_connect_le(uint64_t request_id, const std::string& address,
-                                                  uint32_t timeout_ms) {
-  // BtAddress { address=1 string, address_type=2 PUBLIC=1 }
+                                                  uint32_t timeout_ms, bool wait_passive,
+                                                  uint8_t proto_address_type) {
+  // BtAddress { address=1 string, address_type=2 (PUBLIC=1, RANDOM=2) }
   std::vector<uint8_t> bt_addr;
   put_key(bt_addr, 1, 2);
   put_varint(bt_addr, address.size());
   bt_addr.insert(bt_addr.end(), address.begin(), address.end());
   put_key(bt_addr, 2, 0);
-  put_varint(bt_addr, 1);  // PUBLIC
-  // ConnectLeRequest { address=1, timeout_ms=2 }
+  put_varint(bt_addr, proto_address_type == kProtoAddrRandom ? kProtoAddrRandom : kProtoAddrPublic);
+  // ConnectLeRequest { address=1, timeout_ms=2, wait_passive=3 }
   std::vector<uint8_t> cle;
   put_submsg(cle, 1, bt_addr);
   if (timeout_ms != 0) {
     put_key(cle, 2, 0);
     put_varint(cle, timeout_ms);
+  }
+  if (wait_passive) {
+    put_key(cle, 3, 0);
+    put_varint(cle, 1);
   }
   // Request { connect_le = 6 }
   std::vector<uint8_t> req;
@@ -633,6 +638,40 @@ bool BridgeIpc::parse_response_ok(const uint8_t* data, size_t len) {
       }
       if (saw_error) return err == 0;
       // No error field → proto3 default OK.
+      return true;
+    }
+    if (!skip_field(data, len, i, wire)) return false;
+  }
+  return false;
+}
+
+bool BridgeIpc::parse_response_error(const uint8_t* data, size_t len, uint32_t* code_out) {
+  size_t i = 0;
+  while (i < len) {
+    uint64_t key;
+    if (!read_varint(data, len, i, key)) return false;
+    uint32_t field = static_cast<uint32_t>(key >> 3);
+    uint32_t wire = static_cast<uint32_t>(key & 7);
+    if (field == 3 && wire == 2) {
+      uint64_t l;
+      if (!read_varint(data, len, i, l)) return false;
+      if (i + l > len) return false;
+      const uint8_t* resp = data + i;
+      size_t rlen = static_cast<size_t>(l);
+      size_t j = 0;
+      uint64_t err = 0;
+      while (j < rlen) {
+        uint64_t k2;
+        if (!read_varint(resp, rlen, j, k2)) return false;
+        uint32_t f2 = static_cast<uint32_t>(k2 >> 3);
+        uint32_t w2 = static_cast<uint32_t>(k2 & 7);
+        if (f2 == 1 && w2 == 0) {
+          if (!read_varint(resp, rlen, j, err)) return false;
+          continue;
+        }
+        if (!skip_field(resp, rlen, j, w2)) return false;
+      }
+      if (code_out) *code_out = static_cast<uint32_t>(err);
       return true;
     }
     if (!skip_field(data, len, i, wire)) return false;
@@ -1038,10 +1077,15 @@ bool BridgeIpc::connect_le_gatt_probe(const std::string& address_colon, uint32_t
 bool BridgeIpc::connect_le_open(
     const std::string& address_colon, uint32_t timeout_ms, std::string* device_id_out,
     std::vector<std::pair<std::string, std::vector<GattChar>>>* services_out,
-    std::string* summary_out) {
+    std::string* summary_out, bool wait_passive, uint8_t proto_address_type,
+    uint32_t* error_code_out) {
+  if (error_code_out) *error_code_out = 0;
   if (fd_ < 0) return false;
+  // A passive wait can take minutes; the host sends no events to a client
+  // before its first answer, but do not cap stray frames there anyway.
+  const int max_tries = wait_passive ? (1 << 20) : 128;
   auto wait_response = [&](std::vector<uint8_t>& frame) -> bool {
-    for (int tries = 0; tries < 128; tries++) {
+    for (int tries = 0; tries < max_tries; tries++) {
       if (!read_frame(frame)) return false;
       size_t i = 0;
       while (i < frame.size()) {
@@ -1057,12 +1101,22 @@ bool BridgeIpc::connect_le_open(
   };
 
   uint64_t rid = next_rid_++;
-  if (!write_frame(encode_connect_le(rid, address_colon, timeout_ms))) return false;
+  if (!write_frame(encode_connect_le(rid, address_colon, timeout_ms, wait_passive,
+                                     proto_address_type))) {
+    return false;
+  }
   std::vector<uint8_t> frame;
   if (!wait_response(frame)) return false;
   std::string device_id;
   if (!parse_connect_le_device_id(frame.data(), frame.size(), &device_id)) {
-    if (summary_out) *summary_out = "CONNECT_FAIL";
+    uint32_t code = 0;
+    parse_response_error(frame.data(), frame.size(), &code);
+    if (error_code_out) *error_code_out = code;
+    if (summary_out) {
+      *summary_out = code == kErrTimeout       ? "PASSIVE_TIMEOUT"
+                     : code == kErrUnsupported ? "PASSIVE_UNSUPPORTED"
+                                               : "CONNECT_FAIL";
+    }
     return false;
   }
   if (device_id_out) *device_id_out = device_id;
