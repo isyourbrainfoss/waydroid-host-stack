@@ -14,7 +14,7 @@ chk tesla-frunk.service restart
 chk tesla-frunk.service stop
 chk bluetooth.service start
 echo "== key-state parser (check-only, no send)"
-echo "live: $(/var/lib/fp5-tesla/bin/tesla-frunk-root.sh --check-only)"
+echo "live: $(/var/lib/fp5-tesla/bin/tesla-frunk-root.sh --check-only)  (both must be ok/up before anything is sent)"
 T=$(mktemp); printf '  Notification List:\n    NotificationRecord(0x1: pkg=com.teslamotors.tesla user=UserHandle{0} id=333 Notification(channel=phone_key_service_channel_v2 actions=3))\n                [1] "Front Trunk" -> PendingIntent{x}\n                android.text=String (Disconnected)\n  Snoozed notifications:\n                android.text=String (Connected)\n' > "$T"
 echo "synthetic disconnected: $(/var/lib/fp5-tesla/bin/tesla-frunk-root.sh --check-only "$T") (expect notconnected)"
 printf '  Notification List:\n  Snoozed notifications:\n' > "$T"

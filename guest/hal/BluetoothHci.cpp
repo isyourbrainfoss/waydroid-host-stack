@@ -106,6 +106,9 @@ void BluetoothHci::keepaliveWorker() {
   bool attached = false;
   int failures = 0;
   while (!stop_.load()) {
+    if (link_lost_drain_.exchange(false)) {
+      drainPendingNotifyJoins();
+    }
     if (!ipc.connected()) {
       bool ok = false;
       const char* paths[] = {kBridgeSocket, kBridgeSocketAlt, nullptr};
@@ -184,7 +187,8 @@ uint16_t BluetoothHci::aclHandleOf(const waydroid_bt::Packet& acl) {
   return static_cast<uint16_t>(acl[0] | ((static_cast<uint16_t>(acl[1] & 0x0f)) << 8));
 }
 
-void BluetoothHci::closeAttSessionLocked(uint16_t handle, bool inject_hci_disconnect) {
+void BluetoothHci::closeAttSessionLocked(uint16_t handle, bool inject_hci_disconnect,
+                                         uint8_t reason) {
   // Caller holds att_mu_. Must NOT call BridgeIpc::close/disconnect while
   // holding att_mu_ (worker: io_mu_ then att_mu_ → ABBA deadlock with
   // att_mu_ then io_mu_). Extract shared_ptr + thread, erase map, queue
@@ -198,6 +202,7 @@ void BluetoothHci::closeAttSessionLocked(uint16_t handle, bool inject_hci_discon
   pc.ipc = s->ipc;
   pc.device_id = s->device_id;
   pc.inject_dc = inject_hci_disconnect && was_active;
+  pc.reason = reason;
   pc.handle = handle;
   pc.peer = peer;
   s->notify_run.store(false);
@@ -234,9 +239,9 @@ void BluetoothHci::drainPendingNotifyJoins() {
       pc.ipc->close();  // under io_mu_; wakes poll
     }
     if (pc.inject_dc) {
-      soft_.inject_disconnection_complete(pc.handle, 0x16 /* local host terminated */);
-      ALOGI("Soft HCI inject Disconnection Complete handle=0x%04x peer=%s", pc.handle,
-            pc.peer.c_str());
+      soft_.inject_disconnection_complete(pc.handle, pc.reason);
+      ALOGI("Soft HCI inject Disconnection Complete handle=0x%04x reason=0x%02x peer=%s",
+            pc.handle, pc.reason, pc.peer.c_str());
     }
     if (pc.joiner.joinable()) {
       pc.joiner.join();
@@ -268,7 +273,21 @@ void BluetoothHci::attNotifyWorker(uint16_t handle) {
     std::vector<uint8_t> val;
     // Filter by host device_id so multi-link peers never inject each other's HVNs
     // (host may fan-out GattNotification events to every guest client).
-    if (!ipc->poll_gatt_notification(&cu, &val, 200, device_id)) {
+    const bool got = ipc->poll_gatt_notification(&cu, &val, 200, device_id);
+    if (!device_id.empty() && ipc->take_link_lost(device_id)) {
+      // Host: BlueZ says the LE link is gone (car out of range, supervision
+      // timeout). Tell Fluoride like a controller would: Disconnection
+      // Complete reason 0x08, so apps (Tesla) stop showing "Connected".
+      std::lock_guard<std::mutex> lock(att_mu_);
+      AttSession* s = findSessionByHandleLocked(handle);
+      if (s) {
+        ALOGI("Soft HCI host reports LE link lost handle=0x%04x peer=%s", handle, s->peer.c_str());
+        closeAttSessionLocked(handle, /*inject_hci_disconnect=*/true, 0x08);
+        link_lost_drain_.store(true);
+      }
+      break;
+    }
+    if (!got) {
       continue;
     }
     ALOGI("Soft HCI ATT host notify handle=0x%04x peer=%s char=%s len=%zu", handle,

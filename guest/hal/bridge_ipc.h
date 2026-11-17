@@ -144,6 +144,15 @@ class BridgeIpc {
   static bool parse_gatt_notification(const uint8_t* data, size_t len, std::string* char_uuid_out,
                                       std::vector<uint8_t>* value_out,
                                       std::string* device_id_out = nullptr);
+  // Envelope event.connection_state (field 3) with state DISCONNECTED (0).
+  // The host sends it when BlueZ reports the LE link gone (supervision
+  // timeout / remote terminate) and after host-side disconnects.
+  static bool parse_connection_disconnected(const uint8_t* data, size_t len,
+                                            std::string* device_id_out);
+
+  // True (once) if the host reported the link to device_id as disconnected
+  // on this socket. Case-insensitive. Seen by read_frame/poll paths.
+  bool take_link_lost(const std::string& device_id);
 
  // Test hook: take ownership of an already-connected stream fd.
   void adopt_fd_for_test(int fd) { fd_ = fd; }
@@ -169,6 +178,9 @@ class BridgeIpc {
     std::vector<uint8_t> value;
   };
   std::deque<PendingNotification> pending_;
+  // device_ids (lower case) the host reported Disconnected; guarded by io_mu_.
+  std::vector<std::string> lost_;
+  void note_if_disconnected_locked(const std::vector<uint8_t>& frame);
   int fd_ = -1;
   uint64_t next_rid_ = 100;
   // Serialize request/response and notify poll on the same unix fd.

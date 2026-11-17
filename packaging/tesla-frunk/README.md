@@ -14,7 +14,9 @@ New design:
 - `tesla-frunk-root.sh`: reads the Tesla phone-key notification inside Waydroid; only if it says
   "Connected" and offers "Front Trunk" does it send the same intent as that button
   (requestCode 14 -> `com.teslamotors.ble.action.COMMAND` -> PhoneKeyCommandReceiver, command_id 14).
-  Exit 3 when not connected. `--check-only [file]` evaluates the state without sending anything.
+  Since 17 Nov (link-loss fix): it ALSO requires BlueZ to show a live LE link to the device
+  carrying the Tesla VCSEC GATT service (00000211-b2d1-...), because the notification could
+  stay "Connected" after the link was lost. Exit 3 when not connected. `--check-only [file]` evaluates the state without sending anything.
 
 Install (root, from this dir): `sh install.sh`  (backs up to /var/lib/fp5-backup/20261117-frunk-sensor/)
 Verify (read-only, never starts the unit): `sh verify.sh`

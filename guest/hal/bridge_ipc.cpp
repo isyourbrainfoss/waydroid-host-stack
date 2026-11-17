@@ -227,6 +227,7 @@ bool BridgeIpc::write_frame(const std::vector<uint8_t>& payload) {
 bool BridgeIpc::read_frame(std::vector<uint8_t>& payload) {
   for (;;) {
     if (!read_frame_raw(payload)) return false;
+    note_if_disconnected_locked(payload);
     PendingNotification n;
     if (!parse_gatt_notification(payload.data(), payload.size(), &n.char_uuid, &n.value,
                                  &n.device_id)) {
@@ -1388,6 +1389,7 @@ bool BridgeIpc::poll_gatt_notification(std::string* char_uuid_out, std::vector<u
       close_locked();
       return false;
     }
+    note_if_disconnected_locked(frame);
     if (!parse_gatt_notification(frame.data(), frame.size(), &cu, &val, &dev)) {
       return false;
     }
@@ -1405,6 +1407,94 @@ bool BridgeIpc::poll_gatt_notification(std::string* char_uuid_out, std::vector<u
   if (char_uuid_out) *char_uuid_out = std::move(cu);
   if (value_out) *value_out = std::move(val);
   return true;
+}
+
+static std::string lower_copy(std::string s) {
+  for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  return s;
+}
+
+bool BridgeIpc::parse_connection_disconnected(const uint8_t* data, size_t len,
+                                              std::string* device_id_out) {
+  // Envelope { event=4 { connection_state=3 { device_id=1, address=2, state=3, reason=4 } } }
+  size_t i = 0;
+  while (i < len) {
+    uint64_t key;
+    if (!read_varint(data, len, i, key)) return false;
+    uint32_t field = static_cast<uint32_t>(key >> 3);
+    uint32_t wire = static_cast<uint32_t>(key & 7);
+    if (field == 4 && wire == 2) {
+      uint64_t l;
+      if (!read_varint(data, len, i, l)) return false;
+      if (i + l > len) return false;
+      const uint8_t* ev = data + i;
+      size_t elen = static_cast<size_t>(l);
+      size_t j = 0;
+      while (j < elen) {
+        uint64_t k2;
+        if (!read_varint(ev, elen, j, k2)) return false;
+        uint32_t f2 = static_cast<uint32_t>(k2 >> 3);
+        uint32_t w2 = static_cast<uint32_t>(k2 & 7);
+        if (f2 == 3 && w2 == 2) {
+          uint64_t l2;
+          if (!read_varint(ev, elen, j, l2)) return false;
+          if (j + l2 > elen) return false;
+          const uint8_t* cs = ev + j;
+          size_t clen = static_cast<size_t>(l2);
+          size_t k = 0;
+          std::string dev;
+          uint64_t state = 0;  // proto3 default: DISCONNECTED
+          while (k < clen) {
+            uint64_t k3;
+            if (!read_varint(cs, clen, k, k3)) return false;
+            uint32_t f3 = static_cast<uint32_t>(k3 >> 3);
+            uint32_t w3 = static_cast<uint32_t>(k3 & 7);
+            if (f3 == 1 && w3 == 2) {
+              uint64_t l3;
+              if (!read_varint(cs, clen, k, l3)) return false;
+              if (k + l3 > clen) return false;
+              dev.assign(reinterpret_cast<const char*>(cs + k), static_cast<size_t>(l3));
+              k += static_cast<size_t>(l3);
+            } else if (f3 == 3 && w3 == 0) {
+              if (!read_varint(cs, clen, k, state)) return false;
+            } else if (!skip_field(cs, clen, k, w3)) {
+              return false;
+            }
+          }
+          if (state != 0 || dev.empty()) return false;
+          if (device_id_out) *device_id_out = std::move(dev);
+          return true;
+        }
+        if (!skip_field(ev, elen, j, w2)) return false;
+      }
+      return false;
+    }
+    if (!skip_field(data, len, i, wire)) return false;
+  }
+  return false;
+}
+
+void BridgeIpc::note_if_disconnected_locked(const std::vector<uint8_t>& frame) {
+  std::string dev;
+  if (!parse_connection_disconnected(frame.data(), frame.size(), &dev)) return;
+  dev = lower_copy(dev);
+  for (const auto& d : lost_) {
+    if (d == dev) return;
+  }
+  if (lost_.size() >= 16) lost_.erase(lost_.begin());
+  lost_.push_back(std::move(dev));
+}
+
+bool BridgeIpc::take_link_lost(const std::string& device_id) {
+  std::lock_guard<std::mutex> lock(io_mu_);
+  const std::string want = lower_copy(device_id);
+  for (auto it = lost_.begin(); it != lost_.end(); ++it) {
+    if (*it == want) {
+      lost_.erase(it);
+      return true;
+    }
+  }
+  return false;
 }
 
 bool BridgeIpc::disconnect_device(const std::string& device_id) {

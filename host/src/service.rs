@@ -24,10 +24,15 @@ pub struct BridgeService {
     /// Multi-client event sinks (scan + ATT may be connected at once).
     /// Keyed by monotonic client id so disconnect of one client does not
     /// steal or abort another client's notify stream.
-    event_sinks: Mutex<HashMap<u64, mpsc::Sender<Envelope>>>,
+    event_sinks: Arc<Mutex<HashMap<u64, mpsc::Sender<Envelope>>>>,
     next_client_id: std::sync::atomic::AtomicU64,
     /// Active notify tasks keyed by device_id + char uuid
-    notify_tasks: Mutex<HashMap<String, tokio::task::JoinHandle<()>>>,
+    notify_tasks: Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>>,
+    /// One link-loss watcher per connected LE device_id (upper case). When
+    /// BlueZ reports Device1.Connected=false (supervision timeout, car drove
+    /// off, remote terminate) the guest gets ConnectionState=Disconnected,
+    /// so the HAL can inject an HCI Disconnection Complete like a controller.
+    link_watch: Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>>,
     /// LE links opened by ConnectLe, keyed by device_id (upper case) -> the
     /// IPC client that owns it. When that client goes away without a
     /// Disconnect (guest HAL cancelled a pending connect mid-attempt, HAL
@@ -104,6 +109,16 @@ pub(crate) fn connect_le_device_id(resp: &Envelope) -> Option<String> {
     }
 }
 
+/// ConnectionState=Disconnected event for a lost link (pure — unit tested).
+pub(crate) fn link_lost_event(device_id: &str) -> Envelope {
+    event_envelope(event::Payload::ConnectionState(ConnectionStateEvent {
+        device_id: device_id.to_string(),
+        address: None,
+        state: ConnectionState::Disconnected as i32,
+        reason: "link lost".into(),
+    }))
+}
+
 /// Links owned by `client` (pure helper — unit tested).
 pub(crate) fn links_owned_by(owned: &HashMap<String, u64>, client: u64) -> Vec<String> {
     let mut v: Vec<String> = owned
@@ -120,9 +135,10 @@ impl BridgeService {
         Self {
             bluez,
             scan,
-            event_sinks: Mutex::new(HashMap::new()),
+            event_sinks: Arc::new(Mutex::new(HashMap::new())),
             next_client_id: std::sync::atomic::AtomicU64::new(1),
-            notify_tasks: Mutex::new(HashMap::new()),
+            notify_tasks: Arc::new(Mutex::new(HashMap::new())),
+            link_watch: Arc::new(Mutex::new(HashMap::new())),
             owned_links: Mutex::new(HashMap::new()),
             host_version,
         }
@@ -218,6 +234,42 @@ impl BridgeService {
                 },
             )))
             .await;
+        }
+    }
+
+    /// Start (or restart) the link-loss watcher for `device_id`.
+    async fn watch_link_loss(&self, device_id: &str) {
+        let key = device_id.to_ascii_uppercase();
+        let bluez = self.bluez.clone();
+        let sinks = self.event_sinks.clone();
+        let tasks = self.notify_tasks.clone();
+        let watch = self.link_watch.clone();
+        let dev = device_id.to_string();
+        let key2 = key.clone();
+        let h = tokio::spawn(async move {
+            if let Err(e) = bluez.wait_link_lost(&dev).await {
+                warn!(error = %format!("{e:#}"), "link-loss watch failed; no disconnect forwarding for this link");
+                watch.lock().await.remove(&key2);
+                return;
+            }
+            info!(device_id = %dev, "LE link lost (BlueZ Connected=false): telling guest");
+            {
+                let mut t = tasks.lock().await;
+                for k in notify_task_keys_for_device(t.keys(), &dev) {
+                    if let Some(h) = t.remove(&k) {
+                        h.abort();
+                    }
+                }
+            }
+            let env = link_lost_event(&dev);
+            let list: Vec<_> = sinks.lock().await.values().cloned().collect();
+            for tx in list {
+                let _ = tx.send(env.clone()).await;
+            }
+            watch.lock().await.remove(&key2);
+        });
+        if let Some(old) = self.link_watch.lock().await.insert(key, h) {
+            old.abort();
         }
     }
 
@@ -417,6 +469,7 @@ impl BridgeService {
                                 mtu,
                             }),
                         );
+                        self.watch_link_loss(&device_id).await;
                         // Fire-and-forget connection state for any listeners.
                         let _ = self
                             .emit(event_envelope(event::Payload::ConnectionState(
@@ -436,7 +489,17 @@ impl BridgeService {
                     }
                 }
             }
-            request::Op::Disconnect(req) => match self.bluez.disconnect(&req.device_id).await {
+            request::Op::Disconnect(req) => {
+                // Guest-initiated: it already knows; do not echo a "link lost".
+                if let Some(h) = self
+                    .link_watch
+                    .lock()
+                    .await
+                    .remove(&req.device_id.to_ascii_uppercase())
+                {
+                    h.abort();
+                }
+                match self.bluez.disconnect(&req.device_id).await {
                 Ok(()) => {
                     // Abort all notify streams for this device.
                     {
@@ -463,7 +526,8 @@ impl BridgeService {
                     )
                 }
                 Err(e) => err_response(request_id, ErrorCode::Bluez, e.to_string()),
-            },
+                }
+            }
             request::Op::GattDiscover(req) => match self.bluez.gatt_discover(&req.device_id).await {
                 Ok(services) => ok_response(
                     request_id,
@@ -866,6 +930,22 @@ mod tests {
             vec!["AA:BB:CC:DD:EE:01".to_string(), "AA:BB:CC:DD:EE:02".to_string()]
         );
         assert!(links_owned_by(&m, 9).is_empty());
+    }
+
+    #[test]
+    fn link_lost_event_is_disconnected() {
+        let e = link_lost_event("AA:BB:CC:DD:EE:01");
+        match e.body {
+            Some(envelope::Body::Event(ev)) => match ev.payload {
+                Some(event::Payload::ConnectionState(c)) => {
+                    assert_eq!(c.device_id, "AA:BB:CC:DD:EE:01");
+                    assert_eq!(c.state, ConnectionState::Disconnected as i32);
+                    assert_eq!(c.reason, "link lost");
+                }
+                _ => panic!("not a connection state"),
+            },
+            _ => panic!("not an event"),
+        }
     }
 
     #[test]

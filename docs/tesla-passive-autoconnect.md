@@ -69,3 +69,24 @@ host CPU work until the car connects, versus B55's 12 s active scan every
 * `cargo test`: mgmt packet layout, little-endian address parsing, reply
   matching, address-type mapping, passive request detection, wait default
   and cap.
+
+## Link loss forwarding (17 Nov 2026)
+
+Bug: after walking away from the car the Tesla notification stayed "Connected" for 30+ min.
+BlueZ had `Connected=false`, but the bridge never told the guest: it only emitted
+`ConnectionState=Disconnected` for guest-initiated disconnects, and the HAL ignored
+ConnectionState events entirely, so Fluoride never got an HCI Disconnection Complete.
+This predates the passive auto-connect work (same on main / B55).
+
+Fix:
+- host: after every successful ConnectLe, a per-device task waits for BlueZ
+  `Device1.Connected=false` (or the object going away), aborts that device's notify
+  streams and sends `ConnectionState{DISCONNECTED, reason="link lost"}` to all guest
+  clients. Guest-initiated Disconnect aborts the watcher first (no echo).
+- HAL: `BridgeIpc` records DISCONNECTED events seen on a session socket
+  (`take_link_lost`). The ATT notify worker checks it after each poll, closes its
+  session and injects Disconnection Complete reason 0x08 (connection timeout), like a
+  controller after supervision timeout. The keepalive thread joins the worker.
+- The Tesla app then sees the disconnect, the notification leaves "Connected", and it
+  issues a new background connect (passive auto-connect path).
+- tesla-frunk-root.sh additionally requires a live BlueZ LE link to the VCSEC device.

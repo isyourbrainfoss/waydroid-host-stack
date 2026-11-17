@@ -88,7 +88,9 @@ struct BluetoothHci : public IBluetoothHci {
   void attNotifyWorker(uint16_t handle);
   // Close one session. inject_hci_disconnect=false when Soft HCI already emits
   // Disconnection Complete (stack-initiated Disconnect).
-  void closeAttSessionLocked(uint16_t handle, bool inject_hci_disconnect);
+  // reason: HCI reason in the injected Disconnection Complete
+  // (0x16 local host terminated; 0x08 connection timeout = link lost).
+  void closeAttSessionLocked(uint16_t handle, bool inject_hci_disconnect, uint8_t reason = 0x16);
   void closeAllAttSessionsLocked(bool inject_hci_disconnect);
   // Join notify workers that were detached from sessions while att_mu_ was held.
   void drainPendingNotifyJoins();
@@ -135,6 +137,10 @@ struct BluetoothHci : public IBluetoothHci {
   std::atomic<int64_t> passive_unsupported_until_ms_{0};
 
   // Persistent ping-only attachment to the host bridge.
+  // Set by an ATT notify worker that closed its own session after the host
+  // reported link loss; the keepalive thread drains (joins) it — a worker
+  // cannot join itself.
+  std::atomic<bool> link_lost_drain_{false};
   std::mutex keepalive_mu_;
   std::condition_variable keepalive_cv_;
   std::thread keepalive_thread_;
@@ -151,6 +157,7 @@ struct BluetoothHci : public IBluetoothHci {
     std::string device_id;
     std::thread joiner;
     bool inject_dc = false;
+    uint8_t reason = 0x16;
     uint16_t handle = 0;
     std::string peer;
   };

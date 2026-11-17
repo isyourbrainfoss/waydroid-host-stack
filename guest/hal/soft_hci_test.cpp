@@ -882,6 +882,69 @@ static void test_notification_during_write_is_queued() {
 }
 
 
+static void test_link_lost_event_parsed_and_taken_once() {
+  auto put_varint = [](std::vector<uint8_t>& o, uint64_t v) {
+    while (v >= 0x80) {
+      o.push_back(static_cast<uint8_t>((v & 0x7f) | 0x80));
+      v >>= 7;
+    }
+    o.push_back(static_cast<uint8_t>(v));
+  };
+  auto put_key = [&](std::vector<uint8_t>& o, uint32_t f, uint32_t w) {
+    put_varint(o, (static_cast<uint64_t>(f) << 3) | w);
+  };
+  auto put_sub = [&](std::vector<uint8_t>& o, uint32_t f, const std::vector<uint8_t>& b) {
+    put_key(o, f, 2);
+    put_varint(o, b.size());
+    o.insert(o.end(), b.begin(), b.end());
+  };
+  auto conn_state = [&](const std::string& dev, uint64_t state) {
+    std::vector<uint8_t> cs, ev, env;
+    put_sub(cs, 1, std::vector<uint8_t>(dev.begin(), dev.end()));
+    if (state != 0) {  // proto3: default (DISCONNECTED=0) is omitted on the wire
+      put_key(cs, 3, 0);
+      put_varint(cs, state);
+    }
+    std::string r = "link lost";
+    put_sub(cs, 4, std::vector<uint8_t>(r.begin(), r.end()));
+    put_sub(ev, 3, cs);
+    put_sub(env, 4, ev);
+    return env;
+  };
+  auto frame = [](const std::vector<uint8_t>& p) {
+    std::vector<uint8_t> f = {static_cast<uint8_t>(p.size()), static_cast<uint8_t>(p.size() >> 8),
+                              static_cast<uint8_t>(p.size() >> 16), static_cast<uint8_t>(p.size() >> 24)};
+    f.insert(f.end(), p.begin(), p.end());
+    return f;
+  };
+  std::string dev;
+  auto lost = conn_state("AA:BB:CC:DD:EE:01", 0);
+  assert(BridgeIpc::parse_connection_disconnected(lost.data(), lost.size(), &dev));
+  assert(dev == "AA:BB:CC:DD:EE:01");
+  auto up = conn_state("AA:BB:CC:DD:EE:01", 2);  // CONNECTED
+  assert(!BridgeIpc::parse_connection_disconnected(up.data(), up.size(), &dev));
+
+  // Arrives on the session socket while the notify worker polls.
+  int sv[2];
+  assert(::socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+  auto other = frame(conn_state("AA:BB:CC:DD:EE:02", 0));
+  auto mine = frame(lost);
+  assert(::write(sv[1], other.data(), other.size()) == static_cast<ssize_t>(other.size()));
+  assert(::write(sv[1], mine.data(), mine.size()) == static_cast<ssize_t>(mine.size()));
+  BridgeIpc ipc;
+  ipc.adopt_fd_for_test(sv[0]);
+  std::string cu;
+  std::vector<uint8_t> val;
+  assert(!ipc.poll_gatt_notification(&cu, &val, 50, "aa:bb:cc:dd:ee:01"));
+  assert(!ipc.poll_gatt_notification(&cu, &val, 50, "aa:bb:cc:dd:ee:01"));
+  assert(ipc.take_link_lost("aa:bb:cc:dd:ee:01"));   // case-insensitive
+  assert(!ipc.take_link_lost("AA:BB:CC:DD:EE:01"));  // only once
+  assert(ipc.take_link_lost("AA:BB:CC:DD:EE:02"));   // other link tracked separately
+  ::close(sv[1]);
+  printf("ok link_lost_event_parsed_and_taken_once\n");
+}
+
+
 // ---- Tesla-tolerant reconnect (B55): pending LE Create Connection semantics ----
 namespace b55 {
 std::vector<uint8_t> varint(uint64_t v) {
@@ -1303,6 +1366,7 @@ static void test_prepared_long_write_reassembled() {
 int main() {
   test_prepared_long_write_reassembled();
   test_notification_during_write_is_queued();
+  test_link_lost_event_parsed_and_taken_once();
   test_opcode_of();
   test_command_complete_shape();
   test_reset_and_bd_addr();

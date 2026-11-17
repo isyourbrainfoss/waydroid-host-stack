@@ -575,6 +575,22 @@ impl BlueZ {
         }
     }
 
+    /// Resolve when the LE link to `device_id` is gone: Device1.Connected
+    /// flips to false, the object disappears, or it is already down.
+    pub async fn wait_link_lost(&self, device_id: &str) -> Result<()> {
+        let device = self.device_for_address(device_id).await?;
+        let mut events = device.events().await.context("device events")?;
+        if !device.is_connected().await.unwrap_or(false) {
+            return Ok(());
+        }
+        while let Some(ev) = events.next().await {
+            if let bluer::DeviceEvent::PropertyChanged(bluer::DeviceProperty::Connected(false)) = ev {
+                return Ok(());
+            }
+        }
+        Ok(())
+    }
+
     pub async fn disconnect(&self, device_id: &str) -> Result<()> {
         let key = device_id.to_uppercase();
         let device = {

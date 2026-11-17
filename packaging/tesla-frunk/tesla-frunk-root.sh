@@ -2,13 +2,24 @@
 # /var/lib/fp5-tesla/bin/tesla-frunk-root.sh (root:root 0755), run by tesla-frunk.service.
 # Fires the same intent as the Tesla phone-key notification's "Front Trunk" button
 # (PendingIntent requestCode=14: com.teslamotors.ble.action.COMMAND -> PhoneKeyCommandReceiver),
-# but ONLY if that notification says "Connected" and offers "Front Trunk".
+# but ONLY if BlueZ has a live LE link to the car's phone-key (VCSEC) device AND that
+# notification says "Connected" and offers "Front Trunk". The notification alone can be
+# stale (17 Nov 2026: link lost while the app kept showing "Connected").
 # Exit 0 = sent, 3 = car not connected, 4 = Waydroid not running, 5 = send failed.
 # Test mode (never sends anything):  tesla-frunk-root.sh --check-only [dumpsys-file]
 # Prints nothing sensitive; the dumpsys output never leaves this pipeline.
 set -u
 LXCP=/var/lib/waydroid/lxc
 lxc_sh() { lxc-attach -P "$LXCP" -n waydroid --clear-env -- /system/bin/sh -c "export PATH=/system/bin; $1"; }
+
+VCSEC=00000211-b2d1-43f0-9b88-960cebf8b91e   # Tesla vehicle-security GATT service
+ble_link() {    # stdout: up | down. No addresses printed.
+  for d in $(busctl tree org.bluez 2>/dev/null | grep -oE '/org/bluez/hci[0-9]+/dev_[0-9A-F_]+$' | sort -u); do
+    busctl get-property org.bluez "$d" org.bluez.Device1 UUIDs 2>/dev/null | grep -qi "$VCSEC" || continue
+    [ "$(busctl get-property org.bluez "$d" org.bluez.Device1 Connected 2>/dev/null)" = "b true" ] && { echo up; return; }
+  done
+  echo down
+}
 
 key_state() {   # stdin: `dumpsys notification --noredact`; stdout: ok | nobutton | notconnected
   awk '
@@ -20,11 +31,13 @@ key_state() {   # stdin: `dumpsys notification --noredact`; stdout: ok | nobutto
 }
 
 if [ "${1:-}" = "--check-only" ]; then
-  if [ -n "${2:-}" ]; then key_state < "$2"; else lxc_sh 'dumpsys notification --noredact' 2>/dev/null | key_state; fi
+  if [ -n "${2:-}" ]; then key_state < "$2"; exit 0; fi
+  echo "notification=$(lxc_sh 'dumpsys notification --noredact' 2>/dev/null | key_state) ble_link=$(ble_link)"
   exit 0
 fi
 
 lxc-info -P "$LXCP" -n waydroid -s 2>/dev/null | grep -q RUNNING || { echo "waydroid not running"; exit 4; }
+[ "$(ble_link)" = up ] || { echo "car not connected (no live BLE link)"; exit 3; }
 state=$(lxc_sh 'dumpsys notification --noredact' 2>/dev/null | key_state)
 case "$state" in
   ok) ;;
