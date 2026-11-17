@@ -8,7 +8,7 @@ HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 BK=/var/lib/fp5-backup/20261117-frunk-qs
 EXT=/var/lib/extensions/fp5-frunk-qs
 DESK=/home/fp5/.local/share/applications/tesla-frunk.desktop
-U="runuser -u fp5 -- env DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/60434/bus"
+U="run0 --no-ask-password -u fp5 env DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/60434/bus"
 [ "$(id -u)" = 0 ] || { echo "run as root" >&2; exit 1; }
 cd "$HERE"; sha256sum -c SHA256SUMS
 [ -e "$EXT" ] && { echo "$EXT exists already" >&2; exit 1; }

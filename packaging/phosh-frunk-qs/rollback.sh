@@ -6,7 +6,7 @@ set -u
 BK=/var/lib/fp5-backup/20261117-frunk-qs
 EXT=/var/lib/extensions/fp5-frunk-qs
 DESK=/home/fp5/.local/share/applications/tesla-frunk.desktop
-U="runuser -u fp5 -- env DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/60434/bus"
+U="run0 --no-ask-password -u fp5 env DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/60434/bus"
 [ "$(id -u)" = 0 ] || { echo "run as root" >&2; exit 1; }
 if [ -f "$BK/quick-settings.orig" ]; then
   $U gsettings set mobi.phosh.shell.plugins quick-settings "$(cat "$BK/quick-settings.orig")" \
