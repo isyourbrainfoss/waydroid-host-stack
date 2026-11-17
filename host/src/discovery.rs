@@ -110,6 +110,41 @@ pub fn is_retryable_connect_error(msg: &str) -> bool {
     .any(|k| m.contains(k))
 }
 
+/// Transport for the short pre-connect scan in `connect_le`. LE only: the
+/// target is an LE peripheral (Tesla VCSEC, sensors), and interleaved BR/EDR
+/// inquiry ("auto") halves LE scan time, so a car that advertises slowly is
+/// found later or not at all within the budget. If a guest pair scan is
+/// already running, BlueZ refuses the filter and we simply join that session.
+pub fn connect_scan_transport() -> DiscoveryTransportName {
+    DiscoveryTransportName::Le
+}
+
+/// Extra Connect attempts after a transient LE link-setup abort
+/// (`le-connection-abort-by-local` etc.), all within one overall deadline.
+pub const MAX_CONNECT_RETRIES: u32 = 3;
+
+/// Decide whether `connect_le` may try again after a failed attempt.
+/// `retries_done` = retries already used; `left` = time left before the
+/// guest-visible deadline. Returns the pause before the next attempt, or None
+/// (give up and report a normal connect failure to the guest).
+pub fn connect_retry_delay(
+    retryable: bool,
+    retries_done: u32,
+    left: std::time::Duration,
+) -> Option<std::time::Duration> {
+    use std::time::Duration;
+    if !retryable || retries_done >= MAX_CONNECT_RETRIES {
+        return None;
+    }
+    // Back off a little more each time (300 ms, 600 ms, 900 ms); a retry
+    // needs at least ~2 s to be worth it (rescan + link setup).
+    let pause = Duration::from_millis(300 * u64::from(retries_done + 1));
+    if left <= pause + Duration::from_secs(2) {
+        return None;
+    }
+    Some(pause)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -196,5 +231,32 @@ mod tests {
         let t = DiscoveryTransportName::Le;
         assert!(!t.includes_classic());
         assert!(t.includes_le());
+    }
+
+    #[test]
+    fn connect_scan_is_le_only() {
+        assert_eq!(connect_scan_transport(), DiscoveryTransportName::Le);
+        assert!(!connect_scan_transport().includes_classic());
+    }
+
+    #[test]
+    fn connect_retry_budget() {
+        use std::time::Duration;
+        let lots = Duration::from_secs(20);
+        assert_eq!(
+            connect_retry_delay(true, 0, lots),
+            Some(Duration::from_millis(300))
+        );
+        assert_eq!(
+            connect_retry_delay(true, 2, lots),
+            Some(Duration::from_millis(900))
+        );
+        assert_eq!(connect_retry_delay(true, MAX_CONNECT_RETRIES, lots), None);
+        assert_eq!(connect_retry_delay(false, 0, lots), None, "timeouts are not retried");
+        assert_eq!(
+            connect_retry_delay(true, 0, Duration::from_millis(1500)),
+            None,
+            "never past the guest deadline"
+        );
     }
 }

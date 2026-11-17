@@ -47,6 +47,10 @@ echo "=== bt-host session-restart selftest ==="
 if ! sh "$ROOT/tests/session-restart-selftest.sh"; then
   fail=1
 fi
+echo "=== bt attach-watchdog selftest ==="
+if ! sh "$ROOT/tests/attach-watchdog-selftest.sh"; then
+  fail=1
+fi
 echo "=== golden Phone Key fixture (pull --local) ==="
 if ! sh "$ROOT/tests/phone-key-golden-selftest.sh"; then
   fail=1

@@ -96,6 +96,67 @@ void BridgeIpc::close() {
   close_locked();
 }
 
+void BridgeIpc::shutdown_io() {
+  std::lock_guard<std::mutex> lock(io_mu_);
+  if (fd_ >= 0) ::shutdown(fd_, SHUT_RDWR);
+}
+
+std::vector<uint8_t> BridgeIpc::encode_ping(uint64_t request_id, const std::string& client_name) {
+  // PingRequest { client_name = 1 }
+  std::vector<uint8_t> ping;
+  put_bytes(ping, 1, reinterpret_cast<const uint8_t*>(client_name.data()), client_name.size());
+  // Request { ping = 1 }
+  std::vector<uint8_t> req;
+  put_submsg(req, 1, ping);
+  std::vector<uint8_t> env;
+  put_key(env, 1, 0);
+  put_varint(env, request_id);
+  put_submsg(env, 2, req);
+  return env;
+}
+
+bool BridgeIpc::ping(const std::string& client_name, int timeout_ms) {
+  std::lock_guard<std::mutex> lock(io_mu_);
+  if (fd_ < 0) return false;
+  if (!write_frame(encode_ping(next_rid_++, client_name))) return false;
+  for (int tries = 0; tries < 16; tries++) {
+    pollfd pfd{};
+    pfd.fd = fd_;
+    pfd.events = POLLIN;
+    int pr = ::poll(&pfd, 1, timeout_ms);
+    if (pr <= 0) return false;
+    std::vector<uint8_t> frame;
+    if (!read_frame_raw(frame)) return false;
+    size_t i = 0;
+    while (i < frame.size()) {
+      uint64_t key;
+      if (!read_varint(frame.data(), frame.size(), i, key)) break;
+      uint32_t field = static_cast<uint32_t>(key >> 3);
+      uint32_t wire = static_cast<uint32_t>(key & 7);
+      if (field == 3 && wire == 2) return true;  // any Response = pong
+      if (!skip_field(frame.data(), frame.size(), i, wire)) break;
+    }
+  }
+  return false;
+}
+
+int BridgeIpc::keepalive_wait(int timeout_ms) {
+  std::lock_guard<std::mutex> lock(io_mu_);
+  if (fd_ < 0) return 0;
+  pollfd pfd{};
+  pfd.fd = fd_;
+  pfd.events = POLLIN;
+  int pr = ::poll(&pfd, 1, timeout_ms);
+  if (pr < 0) return errno == EINTR ? 1 : (close_locked(), 0);
+  if (pr == 0) return 1;
+  if (pfd.revents & POLLIN) {
+    std::vector<uint8_t> frame;
+    if (read_frame_raw(frame)) return 1;  // stray frame: drop
+  }
+  close_locked();
+  return 0;
+}
+
 bool BridgeIpc::connected() const {
   std::lock_guard<std::mutex> lock(io_mu_);
   return fd_ >= 0;

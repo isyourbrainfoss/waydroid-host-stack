@@ -58,15 +58,26 @@ struct BluetoothHci : public IBluetoothHci {
   struct PendingLeConn {
     uint8_t peer[6]{};
     uint8_t peer_type = 0;
+    uint64_t gen = 0;
+    uint8_t filter_policy = 0;
   };
+  enum { kAttemptDone = 0, kAttemptFailed = 1, kAttemptStale = 2 };
+  static constexpr uint32_t kHostConnectAttemptMs = 25000;
 
   void eventWorker();
   void enqueueEvent(waydroid_bt::Packet event);
   void enqueueAcl(waydroid_bt::Packet acl);
   void onScanEnable(bool enable);
   void scanWorker();
-  void onLeCreateConnection(const uint8_t peer_addr_le[6], uint8_t peer_addr_type);
+  void onLeCreateConnection(const uint8_t peer_addr_le[6], uint8_t peer_addr_type, uint64_t gen,
+                            uint8_t filter_policy);
   void leConnectWorker();
+  // One host connect + GATT open for attempt `gen`. kAttemptDone: completed
+  // (success or a definitive status sent), kAttemptFailed: host link not up,
+  // still pending, kAttemptStale: the stack cancelled meanwhile.
+  int attemptHostLeConnect(const uint8_t peer[6], uint8_t peer_type, uint64_t gen,
+                           bool first_attempt);
+  void keepaliveWorker();
   void attNotifyWorker(uint16_t handle);
   // Close one session. inject_hci_disconnect=false when Soft HCI already emits
   // Disconnection Complete (stack-initiated Disconnect).
@@ -110,6 +121,13 @@ struct BluetoothHci : public IBluetoothHci {
   std::condition_variable le_conn_cv_;
   std::queue<PendingLeConn> le_conn_queue_;
   std::thread le_conn_thread_;
+  // Socket of the host connect attempt in flight (shut down on Cancel/Reset).
+  std::shared_ptr<waydroid_bt::BridgeIpc> le_inflight_ipc_;
+
+  // Persistent ping-only attachment to the host bridge.
+  std::mutex keepalive_mu_;
+  std::condition_variable keepalive_cv_;
+  std::thread keepalive_thread_;
 
   // Concurrent Soft ATT sessions keyed by HCI connection handle.
   std::mutex att_mu_;

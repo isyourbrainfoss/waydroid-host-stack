@@ -190,12 +190,73 @@ void SoftHci::set_le_create_connection_hook(LeCreateConnectionHook hook) {
   le_connect_hook_ = std::move(hook);
 }
 
+void SoftHci::set_le_create_connection_hook_ex(LeCreateConnectionHookEx hook) {
+  std::lock_guard<std::mutex> lock(mu_);
+  le_connect_hook_ex_ = std::move(hook);
+}
+
+int SoftHci::pending_connect_retry_delay_ms(int attempt) {
+  static const int kSteps[] = {2000, 5000, 10000, 20000, 30000, 60000};
+  if (attempt < 1) attempt = 1;
+  const int n = static_cast<int>(sizeof(kSteps) / sizeof(kSteps[0]));
+  if (attempt <= n) return kSteps[attempt - 1];
+  return 90000;
+}
+
+uint64_t SoftHci::le_create_generation() const {
+  std::lock_guard<std::mutex> lock(mu_);
+  return le_create_gen_;
+}
+
+bool SoftHci::le_create_pending_gen(uint64_t gen) const {
+  std::lock_guard<std::mutex> lock(mu_);
+  return le_create_pending_ && gen == le_create_gen_;
+}
+
+std::vector<SoftHci::AcceptListPeer> SoftHci::accept_list_snapshot() const {
+  std::lock_guard<std::mutex> lock(mu_);
+  std::vector<AcceptListPeer> out;
+  for (size_t i = 0; i < kAcceptListMax; i++) {
+    if (!accept_list_[i].in_use) continue;
+    AcceptListPeer p;
+    p.addr_type = accept_list_[i].addr_type;
+    std::memcpy(p.addr_le, accept_list_[i].addr_le, 6);
+    out.push_back(p);
+  }
+  // Most recently added entry last (it is what resolve_le_create_peer picks first).
+  if (accept_list_last_valid_) {
+    for (size_t i = 0; i < out.size(); i++) {
+      if (out[i].addr_type == accept_list_last_type_ &&
+          std::memcmp(out[i].addr_le, accept_list_last_addr_, 6) == 0) {
+        AcceptListPeer last = out[i];
+        out.erase(out.begin() + static_cast<long>(i));
+        out.push_back(last);
+        break;
+      }
+    }
+  }
+  return out;
+}
+
+bool SoftHci::inject_le_connection_complete_if(uint64_t gen, uint8_t status, uint16_t handle,
+                                               uint8_t role, uint8_t peer_addr_type,
+                                               const uint8_t peer_addr_le[6]) {
+  {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (!le_create_pending_ || gen != le_create_gen_) return false;
+    le_create_pending_ = false;
+  }
+  emit(make_le_connection_complete(status, handle, role, peer_addr_type, peer_addr_le));
+  return true;
+}
+
 void SoftHci::reset() {
   std::lock_guard<std::mutex> lock(mu_);
   open_ = true;
   le_scan_active_ = false;
   inquiry_active_ = false;
   le_create_pending_ = false;
+  le_create_gen_++;
   accept_list_last_valid_ = false;
   accept_list_last_type_ = 0;
   std::memset(accept_list_last_addr_, 0, 6);
@@ -776,19 +837,33 @@ void SoftHci::handle_command(const Packet& cmd) {
       // Initiator_Filter_Policy=0x01 (peer address in command is zero).
       uint8_t peer[6] = {};
       uint8_t peer_type = 0;
+      uint8_t filter_policy = 0;
+      {
+        uint8_t tmp[6];
+        uint8_t tmp_type = 0;
+        parse_le_create_connection_peer(params, plen, tmp, &tmp_type, &filter_policy);
+      }
       const bool resolved = resolve_le_create_peer(params, plen, peer, &peer_type);
       emit(make_command_status(0x00, opcode));
       LeCreateConnectionHook hook;
+      LeCreateConnectionHookEx hook_ex;
+      uint64_t gen = 0;
       {
         std::lock_guard<std::mutex> lock(mu_);
         le_create_pending_ = true;
+        gen = ++le_create_gen_;
         if (resolved) {
           std::memcpy(pending_peer_addr_, peer, 6);
           pending_peer_type_ = peer_type;
         }
         hook = le_connect_hook_;
+        hook_ex = le_connect_hook_ex_;
       }
-      if (hook && resolved) {
+      if (hook_ex && resolved) {
+        // Host bridge path, real-controller semantics: stays pending until the
+        // host link is up or the stack cancels (absent peer = no event at all).
+        hook_ex(peer, peer_type, gen, filter_policy);
+      } else if (hook && resolved) {
         // Host bridge path: hook will inject_le_connection_complete later.
         hook(peer, peer_type);
       } else {
@@ -807,6 +882,8 @@ void SoftHci::handle_command(const Packet& cmd) {
       {
         std::lock_guard<std::mutex> lock(mu_);
         pending = le_create_pending_;
+        // Any in-flight host attempt for the old generation becomes stale.
+        le_create_gen_++;
         if (pending) {
           std::memcpy(peer, pending_peer_addr_, 6);
           peer_type = pending_peer_type_;

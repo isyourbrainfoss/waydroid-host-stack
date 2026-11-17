@@ -122,8 +122,10 @@ subst() {
 UNITS="waydroid-bt-host.service waydroid-bt-inject.service waydroid-bt-inject.timer
 waydroid-bt-lxc-include.service waydroid-bt-lxc-include.path
 waydroid-run-xdg.service waydroid-run-xdg.path
-waydroid-geoclue-fix.service waydroid-gps-inject.service"
+waydroid-geoclue-fix.service waydroid-gps-inject.service
+waydroid-bt-attach-watchdog.service waydroid-bt-attach-watchdog.timer"
 SBIN_SCRIPTS="waydroid-bt-inject-socket.sh waydroid-bt-session-hook.sh waydroid-bt-session-restart.sh
+waydroid-bt-attach-watchdog.sh
 waydroid-guest-bt-probe.sh waydroid-bt-apply-lxc-include.sh waydroid-run-xdg-bind.sh
 waydroid-bt-stabilize-adapter.sh waydroid-restore-bluetooth-apk.sh
 waydroid-patch-bt-jni-timerfd.py waydroid-install-soft-hci-hal.sh
@@ -169,7 +171,8 @@ stage() {
 	subst "$ROOT/packaging/waydroid-bt-inject.timer" "$D$UNITDIR/waydroid-bt-inject.timer"
 	for u in waydroid-bt-lxc-include.service waydroid-bt-lxc-include.path \
 		waydroid-run-xdg.service waydroid-run-xdg.path \
-		waydroid-geoclue-fix.service waydroid-gps-inject.service; do
+		waydroid-geoclue-fix.service waydroid-gps-inject.service \
+		waydroid-bt-attach-watchdog.service waydroid-bt-attach-watchdog.timer; do
 		subst "$ROOT/packaging/systemd/$u" "$D$UNITDIR/$u"
 	done
 	subst "$ROOT/packaging/systemd/waydroid-container.service.d/50-waydroid-bt.conf" \
@@ -203,6 +206,9 @@ activate() {
 	run systemctl daemon-reload
 	run systemctl enable --now waydroid-bt-host.service
 	run systemctl enable --now waydroid-bt-lxc-include.path waydroid-run-xdg.path waydroid-bt-inject.timer
+	# Guest HAL attachment safety net (timer + after-resume run).
+	run systemctl enable --now waydroid-bt-attach-watchdog.timer
+	run systemctl enable waydroid-bt-attach-watchdog.service
 	# GeoClue re-reads conf.d only on restart (it is D-Bus activated; cheap).
 	run systemctl try-restart geoclue.service || true
 	run systemctl enable waydroid-geoclue-fix.service waydroid-gps-inject.service
@@ -213,7 +219,7 @@ activate() {
 }
 
 uninstall() {
-	for u in waydroid-gps-inject.service waydroid-geoclue-fix.service waydroid-bt-inject.timer waydroid-run-xdg.path waydroid-bt-lxc-include.path waydroid-bt-host.service; do
+	for u in waydroid-bt-attach-watchdog.timer waydroid-bt-attach-watchdog.service waydroid-gps-inject.service waydroid-geoclue-fix.service waydroid-bt-inject.timer waydroid-run-xdg.path waydroid-bt-lxc-include.path waydroid-bt-host.service; do
 		run systemctl disable --now "$u" 2>/dev/null || true
 	done
 	for u in $UNITS; do run rm -f "$UNITDIR/$u"; done

@@ -1,4 +1,6 @@
 #include <algorithm>
+#include <chrono>
+#include <thread>
 #include <sys/socket.h>
 #include <unistd.h>
 // Host-side unit tests for SoftHci + Soft ATT pure helpers (no Android HIDL).
@@ -880,6 +882,250 @@ static void test_notification_during_write_is_queued() {
 }
 
 
+// ---- Tesla-tolerant reconnect (B55): pending LE Create Connection semantics ----
+namespace b55 {
+std::vector<uint8_t> varint(uint64_t v) {
+  std::vector<uint8_t> o;
+  while (v >= 0x80) {
+    o.push_back(static_cast<uint8_t>((v & 0x7f) | 0x80));
+    v >>= 7;
+  }
+  o.push_back(static_cast<uint8_t>(v));
+  return o;
+}
+void key(std::vector<uint8_t>& o, uint32_t f, uint32_t w) {
+  auto v = varint((static_cast<uint64_t>(f) << 3) | w);
+  o.insert(o.end(), v.begin(), v.end());
+}
+void sub(std::vector<uint8_t>& o, uint32_t f, const std::vector<uint8_t>& b) {
+  key(o, f, 2);
+  auto v = varint(b.size());
+  o.insert(o.end(), v.begin(), v.end());
+  o.insert(o.end(), b.begin(), b.end());
+}
+std::vector<uint8_t> frame(const std::vector<uint8_t>& p) {
+  std::vector<uint8_t> f = {static_cast<uint8_t>(p.size()), static_cast<uint8_t>(p.size() >> 8),
+                            static_cast<uint8_t>(p.size() >> 16),
+                            static_cast<uint8_t>(p.size() >> 24)};
+  f.insert(f.end(), p.begin(), p.end());
+  return f;
+}
+// Read one length-prefixed frame from fd (blocking). Empty on EOF.
+std::vector<uint8_t> read_frame(int fd) {
+  uint8_t h[4];
+  size_t got = 0;
+  while (got < 4) {
+    ssize_t n = ::read(fd, h + got, 4 - got);
+    if (n <= 0) return {};
+    got += static_cast<size_t>(n);
+  }
+  uint32_t len = h[0] | (h[1] << 8) | (h[2] << 16) | (static_cast<uint32_t>(h[3]) << 24);
+  std::vector<uint8_t> p(len);
+  got = 0;
+  while (got < len) {
+    ssize_t n = ::read(fd, p.data() + got, len - got);
+    if (n <= 0) return {};
+    got += static_cast<size_t>(n);
+  }
+  return p;
+}
+// Host error Response (as the bridge sends for "car not found").
+std::vector<uint8_t> err_response(uint64_t rid, const std::string& msg) {
+  std::vector<uint8_t> resp, env;
+  key(resp, 1, 0);
+  auto e = varint(5);  // ErrorCode BLUEZ-ish (non-zero)
+  resp.insert(resp.end(), e.begin(), e.end());
+  sub(resp, 2, std::vector<uint8_t>(msg.begin(), msg.end()));
+  key(env, 1, 0);
+  auto r = varint(rid);
+  env.insert(env.end(), r.begin(), r.end());
+  sub(env, 3, resp);
+  return frame(env);
+}
+std::vector<uint8_t> ping_response(uint64_t rid) {
+  std::vector<uint8_t> resp, env;
+  sub(resp, 10, {});
+  key(env, 1, 0);
+  auto r = varint(rid);
+  env.insert(env.end(), r.begin(), r.end());
+  sub(env, 3, resp);
+  return frame(env);
+}
+// Fake, clearly non-existent target (documentation-style address).
+const Packet kDirectCreate = {0x0D, 0x20, 25,   0x10, 0x00, 0x10, 0x00, 0x00, 0x01, 0x01, 0x00,
+                              0x00, 0x00, 0x00, 0x02, 0x00, 0x18, 0x00, 0x28, 0x00, 0x00, 0x00,
+                              0x48, 0x00, 0x00, 0x00, 0x00, 0x00};
+}  // namespace b55
+
+static int count_conn_complete(const std::vector<Packet>& ev, uint8_t* last_status = nullptr) {
+  int n = 0;
+  for (const auto& e : ev) {
+    if (e.size() >= 4 && e[0] == 0x3E && e[2] == 0x01) {
+      n++;
+      if (last_status) *last_status = e[3];
+    }
+  }
+  return n;
+}
+
+// Absent peer: with the _ex hook nothing at all is reported until the stack
+// cancels; then exactly one Connection Complete (0x02), and a late host result
+// for the cancelled attempt is swallowed.
+static void test_pending_connect_absent_peer_until_cancel() {
+  SoftHci hci;
+  std::vector<Packet> ev;
+  hci.set_event_sink([&](const Packet& e) { ev.push_back(e); });
+  uint64_t got_gen = 0;
+  uint8_t got_policy = 0xff;
+  hci.set_le_create_connection_hook_ex(
+      [&](const uint8_t*, uint8_t, uint64_t gen, uint8_t pol) {
+        got_gen = gen;
+        got_policy = pol;
+      });
+  hci.handle_command(b55::kDirectCreate);
+  assert(got_gen != 0 && got_policy == 0x00);
+  assert(hci.le_create_pending_gen(got_gen));
+  assert(count_conn_complete(ev) == 0);  // host attempts failing: still nothing
+  hci.handle_command({0x0E, 0x20, 0x00});  // LE Create Connection Cancel
+  uint8_t st = 0xff;
+  assert(count_conn_complete(ev, &st) == 1 && st == 0x02);
+  assert(!hci.le_create_pending_gen(got_gen));
+  uint8_t peer[6] = {0x01, 0x00, 0x00, 0x00, 0x00, 0x02};
+  assert(!hci.inject_le_connection_complete_if(got_gen, 0x00, 0x0040, 0, 1, peer));
+  assert(count_conn_complete(ev) == 1);
+  printf("ok pending_connect_absent_peer_until_cancel\n");
+}
+
+// Success for the current attempt is delivered once; a newer Create makes an
+// older generation stale; Reset invalidates everything.
+static void test_pending_connect_generations() {
+  SoftHci hci;
+  std::vector<Packet> ev;
+  hci.set_event_sink([&](const Packet& e) { ev.push_back(e); });
+  std::vector<uint64_t> gens;
+  hci.set_le_create_connection_hook_ex(
+      [&](const uint8_t*, uint8_t, uint64_t gen, uint8_t) { gens.push_back(gen); });
+  hci.handle_command(b55::kDirectCreate);
+  hci.handle_command(b55::kDirectCreate);
+  assert(gens.size() == 2 && gens[1] > gens[0]);
+  assert(!hci.le_create_pending_gen(gens[0]));
+  uint8_t peer[6] = {0x01, 0x00, 0x00, 0x00, 0x00, 0x02};
+  assert(!hci.inject_le_connection_complete_if(gens[0], 0x00, 0x0040, 0, 1, peer));
+  assert(hci.inject_le_connection_complete_if(gens[1], 0x00, 0x0040, 0, 1, peer));
+  assert(!hci.inject_le_connection_complete_if(gens[1], 0x00, 0x0040, 0, 1, peer));
+  uint8_t st = 0xff;
+  assert(count_conn_complete(ev, &st) == 1 && st == 0x00);
+  hci.handle_command(b55::kDirectCreate);
+  const uint64_t g3 = gens.back();
+  hci.handle_command({0x03, 0x0C, 0x00});  // Reset
+  assert(!hci.le_create_pending_gen(g3));
+  assert(hci.le_create_generation() > g3);
+  printf("ok pending_connect_generations\n");
+}
+
+// Background connect (accept list): policy 0x01 reaches the hook and the
+// snapshot lists every target, most recently added last.
+static void test_background_connect_accept_list_snapshot() {
+  SoftHci hci;
+  hci.set_event_sink([](const Packet&) {});
+  uint8_t pol = 0xff;
+  hci.set_le_create_connection_hook_ex(
+      [&](const uint8_t*, uint8_t, uint64_t, uint8_t p) { pol = p; });
+  hci.handle_command({0x11, 0x20, 0x07, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x02});
+  hci.handle_command({0x11, 0x20, 0x07, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x02});
+  uint8_t create[28] = {0x0D, 0x20, 0x19, 0x60, 0x00, 0x30, 0x00, 0x01, 0x00, 0x00,
+                        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x18, 0x00, 0x28, 0x00,
+                        0x00, 0x00, 0x48, 0x00, 0x00, 0x00, 0x00, 0x00};
+  hci.handle_command(Packet(create, create + 28));
+  assert(pol == 0x01);
+  auto list = hci.accept_list_snapshot();
+  assert(list.size() == 2);
+  assert(list.back().addr_le[0] == 0x03 && list.back().addr_type == 0x00);
+  assert(list.front().addr_le[0] == 0x01 && list.front().addr_type == 0x01);
+  printf("ok background_connect_accept_list_snapshot\n");
+}
+
+static void test_pending_connect_retry_delays() {
+  const int want[] = {2000, 5000, 10000, 20000, 30000, 60000, 90000, 90000};
+  for (int i = 0; i < 8; i++) {
+    assert(SoftHci::pending_connect_retry_delay_ms(i + 1) == want[i]);
+  }
+  assert(SoftHci::pending_connect_retry_delay_ms(0) == 2000);
+  assert(SoftHci::pending_connect_retry_delay_ms(1000) == 90000);
+  printf("ok pending_connect_retry_delays\n");
+}
+
+// A failed host connect (car not found) is a normal error Response: the IPC
+// socket stays usable (still attached), and a ping on it still works.
+static void test_failed_connect_keeps_ipc_attached() {
+  int sv[2];
+  assert(::socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+  std::thread host([&]() {
+    auto req = b55::read_frame(sv[1]);  // ConnectLe
+    assert(!req.empty());
+    auto e = b55::err_response(100, "device not found after 12.0s scan");
+    assert(::write(sv[1], e.data(), e.size()) == static_cast<ssize_t>(e.size()));
+    auto ping = b55::read_frame(sv[1]);  // Ping
+    assert(!ping.empty());
+    auto p = b55::ping_response(101);
+    assert(::write(sv[1], p.data(), p.size()) == static_cast<ssize_t>(p.size()));
+  });
+  BridgeIpc ipc;
+  ipc.adopt_fd_for_test(sv[0]);
+  std::string dev, summary;
+  std::vector<std::pair<std::string, std::vector<BridgeIpc::GattChar>>> svcs;
+  assert(!ipc.connect_le_open("02:00:00:00:00:01", 25000, &dev, &svcs, &summary));
+  assert(summary == "CONNECT_FAIL");
+  assert(ipc.connected());
+  assert(ipc.ping("soft-hci-keepalive", 2000));
+  host.join();
+  ::close(sv[1]);
+  printf("ok failed_connect_keeps_ipc_attached\n");
+}
+
+// Keepalive: stays attached while idle, notices the host closing the socket.
+static void test_keepalive_wait_and_detect_close() {
+  int sv[2];
+  assert(::socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+  BridgeIpc ipc;
+  ipc.adopt_fd_for_test(sv[0]);
+  assert(ipc.keepalive_wait(50) == 1);
+  auto stray = b55::ping_response(7);  // stray frame is dropped
+  assert(::write(sv[1], stray.data(), stray.size()) == static_cast<ssize_t>(stray.size()));
+  assert(ipc.keepalive_wait(50) == 1);
+  ::close(sv[1]);
+  assert(ipc.keepalive_wait(500) == 0);
+  assert(!ipc.connected());
+  // Bridge socket missing (bridge down): connect fails cleanly, no crash.
+  assert(!ipc.connect("/nonexistent/waydroid-bt/host.sock"));
+  printf("ok keepalive_wait_and_detect_close\n");
+}
+
+// Cancel during an in-flight host attempt: shutdown_io wakes the blocked
+// request at once instead of waiting for the host's 25 s budget.
+static void test_shutdown_io_aborts_inflight_connect() {
+  int sv[2];
+  assert(::socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+  BridgeIpc ipc;
+  ipc.adopt_fd_for_test(sv[0]);
+  bool ok = true;
+  auto t0 = std::chrono::steady_clock::now();
+  std::thread att([&]() {
+    std::string dev, summary;
+    std::vector<std::pair<std::string, std::vector<BridgeIpc::GattChar>>> svcs;
+    ok = ipc.connect_le_open("02:00:00:00:00:01", 25000, &dev, &svcs, &summary);
+  });
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  ipc.shutdown_io();
+  att.join();
+  auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - t0)
+                .count();
+  assert(!ok && ms < 2000);
+  ::close(sv[1]);
+  printf("ok shutdown_io_aborts_inflight_connect (%lld ms)\n", static_cast<long long>(ms));
+}
+
 // Long write (Prepare 0x16 x2 + Execute 0x18) must reach the host as ONE write
 // of the reassembled value (Tesla add-key 285 B at MTU 250 was dropped).
 static void test_prepared_long_write_reassembled() {
@@ -977,6 +1223,13 @@ int main() {
   test_multi_link_soft_att_isolation();
   test_parse_gatt_notification_device_id();
   test_parse_response_ok_missing_error_field();
+  test_pending_connect_absent_peer_until_cancel();
+  test_pending_connect_generations();
+  test_background_connect_accept_list_snapshot();
+  test_pending_connect_retry_delays();
+  test_failed_connect_keeps_ipc_attached();
+  test_keepalive_wait_and_detect_close();
+  test_shutdown_io_aborts_inflight_connect();
   printf("ALL_SOFT_HCI_TESTS_OK\n");
   return 0;
 }

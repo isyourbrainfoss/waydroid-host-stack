@@ -4,6 +4,9 @@
 
 #include <log/log.h>
 
+#include <time.h>
+
+#include <algorithm>
 #include <cctype>
 #include <chrono>
 #include <cstdio>
@@ -25,8 +28,10 @@ BluetoothHci::BluetoothHci() {
     enqueueEvent(event);
   });
   soft_.set_scan_enable_hook([this](bool enable) { onScanEnable(enable); });
-  soft_.set_le_create_connection_hook(
-      [this](const uint8_t peer[6], uint8_t t) { onLeCreateConnection(peer, t); });
+  soft_.set_le_create_connection_hook_ex(
+      [this](const uint8_t peer[6], uint8_t t, uint64_t gen, uint8_t policy) {
+        onLeCreateConnection(peer, t, gen, policy);
+      });
   soft_.set_disconnect_hook([this](uint16_t handle, uint8_t /*reason*/) {
     // Join notify worker after signaling stop+close, but only erase after the
     // worker can no longer observe the session map entry (shared_ptr keeps IPC).
@@ -63,6 +68,7 @@ BluetoothHci::BluetoothHci() {
   event_thread_ = std::thread([this]() { eventWorker(); });
   scan_thread_ = std::thread([this]() { scanWorker(); });
   le_conn_thread_ = std::thread([this]() { leConnectWorker(); });
+  keepalive_thread_ = std::thread([this]() { keepaliveWorker(); });
 }
 
 BluetoothHci::~BluetoothHci() {
@@ -85,6 +91,51 @@ BluetoothHci::~BluetoothHci() {
   if (le_conn_thread_.joinable()) {
     le_conn_thread_.join();
   }
+  keepalive_cv_.notify_all();
+  if (keepalive_thread_.joinable()) {
+    keepalive_thread_.join();
+  }
+}
+
+void BluetoothHci::keepaliveWorker() {
+  // One long-lived, ping-only connection to the host bridge for the whole HAL
+  // lifetime. Scan and LE connect still use their own short-lived sockets;
+  // this one only shows (host side and to the watchdog) that the guest is
+  // attached, and reattaches on its own after a bridge restart.
+  waydroid_bt::BridgeIpc ipc;
+  bool attached = false;
+  int failures = 0;
+  while (!stop_.load()) {
+    if (!ipc.connected()) {
+      bool ok = false;
+      const char* paths[] = {kBridgeSocket, kBridgeSocketAlt, nullptr};
+      for (int i = 0; paths[i] && !ok; i++) {
+        if (ipc.connect(paths[i])) {
+          ok = ipc.ping("soft-hci-keepalive");
+          if (!ok) ipc.close();
+        }
+      }
+      if (ok) {
+        ALOGI("Soft HCI keepalive attached to host bridge");
+        attached = true;
+        failures = 0;
+      } else {
+        if (attached || failures == 0) {
+          ALOGW("Soft HCI keepalive: host bridge not reachable; retrying every 2 s");
+        }
+        attached = false;
+        failures++;
+        std::unique_lock<std::mutex> lock(keepalive_mu_);
+        keepalive_cv_.wait_for(lock, std::chrono::seconds(2), [this]() { return stop_.load(); });
+        continue;
+      }
+    }
+    if (ipc.keepalive_wait(1000) == 0) {
+      ALOGW("Soft HCI keepalive: host bridge closed the socket; reattaching");
+      attached = false;
+    }
+  }
+  ipc.close();
 }
 
 void BluetoothHci::enqueueEvent(waydroid_bt::Packet event) {
@@ -415,24 +466,53 @@ Return<void> BluetoothHci::sendHciCommand(const hidl_vec<uint8_t>& command) {
   uint16_t opc = waydroid_bt::SoftHci::opcode_of(cmd);
   ALOGI("Soft HCI cmd opcode=0x%04x len=%zu", opc, cmd.size());
   soft_.handle_command(cmd);
+  if (opc == 0x200E /* LE Create Connection Cancel */ || opc == 0x0C03 /* Reset */) {
+    // Stop a pending host connect attempt now; the stack already got its
+    // Connection Complete (0x02) from Soft HCI.
+    std::shared_ptr<waydroid_bt::BridgeIpc> inflight;
+    {
+      std::lock_guard<std::mutex> lock(le_conn_mu_);
+      inflight = le_inflight_ipc_;
+    }
+    if (inflight) inflight->shutdown_io();
+    le_conn_cv_.notify_all();
+  }
   return Void();
 }
 
-void BluetoothHci::onLeCreateConnection(const uint8_t peer_addr_le[6], uint8_t peer_addr_type) {
+void BluetoothHci::onLeCreateConnection(const uint8_t peer_addr_le[6], uint8_t peer_addr_type,
+                                        uint64_t gen, uint8_t filter_policy) {
   {
     std::lock_guard<std::mutex> lock(le_conn_mu_);
     PendingLeConn p;
     std::memcpy(p.peer, peer_addr_le, 6);
     p.peer_type = peer_addr_type;
+    p.gen = gen;
+    p.filter_policy = filter_policy;
     le_conn_queue_.push(p);
   }
   le_conn_cv_.notify_one();
 }
 
+// Suspend detection: CLOCK_BOOTTIME advances during s2idle, CLOCK_MONOTONIC
+// does not. Returns ms of suspend since the previous call (first call: 0).
+static int64_t suspendGapMs() {
+  static std::mutex mu;
+  static int64_t last_delta = -1;
+  timespec b{}, m{};
+  clock_gettime(CLOCK_BOOTTIME, &b);
+  clock_gettime(CLOCK_MONOTONIC, &m);
+  const int64_t delta = (static_cast<int64_t>(b.tv_sec) - m.tv_sec) * 1000 +
+                        (static_cast<int64_t>(b.tv_nsec) - m.tv_nsec) / 1000000;
+  std::lock_guard<std::mutex> lock(mu);
+  const int64_t gap = last_delta < 0 ? 0 : delta - last_delta;
+  last_delta = delta;
+  return gap > 0 ? gap : 0;
+}
+
 void BluetoothHci::leConnectWorker() {
   while (!stop_.load()) {
-    uint8_t peer[6];
-    uint8_t peer_type = 0;
+    PendingLeConn p;
     {
       std::unique_lock<std::mutex> lock(le_conn_mu_);
       le_conn_cv_.wait(lock, [this]() { return stop_.load() || !le_conn_queue_.empty(); });
@@ -442,40 +522,114 @@ void BluetoothHci::leConnectWorker() {
       if (le_conn_queue_.empty()) {
         continue;
       }
-      PendingLeConn p = le_conn_queue_.front();
+      p = le_conn_queue_.front();
       le_conn_queue_.pop();
-      std::memcpy(peer, p.peer, 6);
-      peer_type = p.peer_type;
     }
     if (stop_.load()) {
       return;
     }
-
-    // Format AA:BB:... from HCI LE byte order (little-endian of colon string).
-    char addr_str[18];
-    std::snprintf(addr_str, sizeof(addr_str), "%02X:%02X:%02X:%02X:%02X:%02X", peer[5], peer[4],
-                  peer[3], peer[2], peer[1], peer[0]);
-    ALOGI("Soft HCI LE Create Connection peer=%s type=%u — host bridge + ATT (multi-link)",
-          addr_str, static_cast<unsigned>(peer_type));
-
-    // Already bridged to this peer: re-emit success — keep other links intact.
-    {
-      std::lock_guard<std::mutex> lock(att_mu_);
-      if (AttSession* existing = findSessionByPeerLocked(addr_str)) {
-        ALOGI("Soft HCI LE already connected to %s handle=0x%04x — re-inject CC", addr_str,
-              existing->handle);
-        soft_.inject_le_connection_complete(0x00, existing->handle, 0x00, peer_type, peer);
-        continue;
-      }
-      if (att_sessions_.size() >= kMaxAttSessions) {
-        ALOGW("Soft HCI LE max concurrent links (%zu) — reject %s", kMaxAttSessions, addr_str);
-        soft_.inject_le_connection_complete(0x0D /* Connection Rejected Limited Resources */,
-                                            0x0000, 0x00, peer_type, peer);
-        continue;
-      }
+    if (!soft_.le_create_pending_gen(p.gen)) {
+      ALOGI("Soft HCI LE Create Connection gen=%llu already cancelled — skip",
+            static_cast<unsigned long long>(p.gen));
+      continue;
     }
 
-    // Pause scan briefly so BlueZ can connect; do NOT tear down existing ATT.
+    // Keep the connection pending and retry the host link until it is up or
+    // the stack cancels, like a real controller does for an absent peer. A
+    // missing car is therefore never a stack-visible failure; the Tesla app
+    // sees the usual timeout/cancel from Android itself and keeps retrying.
+    const auto started = std::chrono::steady_clock::now();
+    suspendGapMs();  // reset baseline
+    int attempt = 0;
+    size_t rr = 0;  // round-robin over the accept list for background connects
+    while (!stop_.load() && soft_.le_create_pending_gen(p.gen)) {
+      uint8_t target[6];
+      uint8_t target_type = p.peer_type;
+      std::memcpy(target, p.peer, 6);
+      if (p.filter_policy == 0x01) {
+        auto list = soft_.accept_list_snapshot();
+        if (!list.empty()) {
+          // Most recent entry first, then the others in turn.
+          const auto& e = list[list.size() - 1 - (rr++ % list.size())];
+          std::memcpy(target, e.addr_le, 6);
+          target_type = e.addr_type;
+        }
+      }
+      attempt++;
+      const int r = attemptHostLeConnect(target, target_type, p.gen, attempt == 1);
+      if (r != kAttemptFailed) break;
+      if (!soft_.le_create_pending_gen(p.gen)) break;
+
+      const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                  std::chrono::steady_clock::now() - started)
+                                  .count();
+      if (p.filter_policy == 0x00 && elapsed_ms >= waydroid_bt::SoftHci::kDirectConnectMaxMs) {
+        // Safety net only: GD cancels direct connects itself after 30 s.
+        if (soft_.inject_le_connection_complete_if(p.gen, 0x3E, 0x0000, 0x00, p.peer_type,
+                                                   p.peer)) {
+          ALOGI("Soft HCI LE direct connect gen=%llu no cancel after %lld ms — status=0x3E",
+                static_cast<unsigned long long>(p.gen), static_cast<long long>(elapsed_ms));
+        }
+        break;
+      }
+      int delay_ms = waydroid_bt::SoftHci::pending_connect_retry_delay_ms(attempt);
+      ALOGI("Soft HCI LE pending connect gen=%llu policy=%u attempt=%d: host link not up; "
+            "retry in %d s (still pending, nothing reported to the stack)",
+            static_cast<unsigned long long>(p.gen), static_cast<unsigned>(p.filter_policy),
+            attempt, delay_ms / 1000);
+      // Wait in short slices so a resume from suspend (peer may now be in
+      // range) or a cancel is noticed quickly.
+      auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(delay_ms);
+      while (!stop_.load() && soft_.le_create_pending_gen(p.gen)) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= until) break;
+        const int64_t gap = suspendGapMs();
+        if (gap > 5000) {
+          ALOGI("Soft HCI LE pending connect gen=%llu: resumed after %lld s suspend — retry now",
+                static_cast<unsigned long long>(p.gen), static_cast<long long>(gap / 1000));
+          attempt = 0;  // fast retries again
+          break;
+        }
+        std::unique_lock<std::mutex> lock(le_conn_mu_);
+        le_conn_cv_.wait_for(lock, std::min(std::chrono::milliseconds(2000),
+                                            std::chrono::duration_cast<std::chrono::milliseconds>(
+                                                until - now)));
+        if (!le_conn_queue_.empty()) break;  // newer request (old one is stale then)
+      }
+    }
+  }
+}
+
+int BluetoothHci::attemptHostLeConnect(const uint8_t peer[6], uint8_t peer_type, uint64_t gen,
+                                       bool first_attempt) {
+  // Format AA:BB:... from HCI LE byte order (little-endian of colon string).
+  char addr_str[18];
+  std::snprintf(addr_str, sizeof(addr_str), "%02X:%02X:%02X:%02X:%02X:%02X", peer[5], peer[4],
+                peer[3], peer[2], peer[1], peer[0]);
+  ALOGI("Soft HCI LE Create Connection peer=%s type=%u — host bridge + ATT (multi-link)",
+        addr_str, static_cast<unsigned>(peer_type));
+
+  // Already bridged to this peer: re-emit success — keep other links intact.
+  {
+    std::lock_guard<std::mutex> lock(att_mu_);
+    if (AttSession* existing = findSessionByPeerLocked(addr_str)) {
+      ALOGI("Soft HCI LE already connected to %s handle=0x%04x — re-inject CC", addr_str,
+            existing->handle);
+      soft_.inject_le_connection_complete_if(gen, 0x00, existing->handle, 0x00, peer_type, peer);
+      return kAttemptDone;
+    }
+    if (att_sessions_.size() >= kMaxAttSessions) {
+      ALOGW("Soft HCI LE max concurrent links (%zu) — reject %s", kMaxAttSessions, addr_str);
+      soft_.inject_le_connection_complete_if(gen, 0x0D /* Connection Rejected Limited Resources */,
+                                          0x0000, 0x00, peer_type, peer);
+      return kAttemptDone;
+    }
+  }
+
+  // Pause scan briefly so BlueZ can connect (first attempt only, so a long
+  // pending background connect never keeps killing app scans); do NOT tear
+  // down existing ATT.
+  if (first_attempt) {
     {
       std::lock_guard<std::mutex> lock(scan_mu_);
       scan_hold_until_ = {};
@@ -483,147 +637,175 @@ void BluetoothHci::leConnectWorker() {
     }
     scan_cv_.notify_all();
     std::this_thread::sleep_for(std::chrono::milliseconds(500));
+  }
+  if (!soft_.le_create_pending_gen(gen)) return kAttemptStale;
 
-    auto ipc = std::make_shared<waydroid_bt::BridgeIpc>();
-    bool ok = false;
-    std::string device_id;
-    std::string summary;
-    std::vector<std::pair<std::string, std::vector<waydroid_bt::BridgeIpc::GattChar>>> services;
-    const char* paths[] = {kBridgeSocket, kBridgeSocketAlt, nullptr};
-    for (int i = 0; paths[i]; i++) {
-      if (ipc->connect(paths[i])) {
-        ALOGI("Soft HCI bridge connect_le_open via %s peer=%s", paths[i], addr_str);
-        ok = ipc->connect_le_open(addr_str, 25000, &device_id, &services, &summary);
-        break;
+  auto ipc = std::make_shared<waydroid_bt::BridgeIpc>();
+  bool ok = false;
+  std::string device_id;
+  std::string summary;
+  std::vector<std::pair<std::string, std::vector<waydroid_bt::BridgeIpc::GattChar>>> services;
+  const char* paths[] = {kBridgeSocket, kBridgeSocketAlt, nullptr};
+  for (int i = 0; paths[i]; i++) {
+    if (ipc->connect(paths[i])) {
+      ALOGI("Soft HCI bridge connect_le_open via %s peer=%s gen=%llu", paths[i], addr_str,
+            static_cast<unsigned long long>(gen));
+      {
+        std::lock_guard<std::mutex> lock(le_conn_mu_);
+        le_inflight_ipc_ = ipc;
       }
-    }
-    if (!ok) {
-      ALOGW("Soft HCI bridge LE connect/GATT failed peer=%s summary=%s", addr_str,
-            summary.empty() ? "none" : summary.c_str());
-      soft_.inject_le_connection_complete(0x3E, 0x0000, 0x00, peer_type, peer);
-      ALOGI("Soft HCI LE Connection Complete status=0x3E (host connect failed) peer=%s", addr_str);
-      continue;
-    }
-
-    ALOGI("Soft HCI bridge %s", summary.c_str());
-    uint16_t handle = 0;
-    {
-      std::lock_guard<std::mutex> lock(att_mu_);
-      // Race: peer might have been connected by another path.
-      if (AttSession* existing = findSessionByPeerLocked(addr_str)) {
-        ALOGI("Soft HCI LE peer %s connected during open — drop duplicate host link", addr_str);
-        ipc->disconnect_device(device_id);
-        ipc->close();
-        soft_.inject_le_connection_complete(0x00, existing->handle, 0x00, peer_type, peer);
-        continue;
+      // Re-check after publishing: a Cancel that raced in before we stored
+      // the pointer could not shut this socket down.
+      if (soft_.le_create_pending_gen(gen)) {
+        // 25 s total on the host (scan + connect, one deadline): answers
+        // before GD's 30 s direct-connect timeout.
+        ok = ipc->connect_le_open(addr_str, kHostConnectAttemptMs, &device_id, &services,
+                                  &summary);
       }
-      handle = allocConnHandleLocked();
-      if (handle == 0) {
-        ipc->disconnect_device(device_id);
-        ipc->close();
-        soft_.inject_le_connection_complete(0x0D, 0x0000, 0x00, peer_type, peer);
-        continue;
+      {
+        std::lock_guard<std::mutex> lock(le_conn_mu_);
+        le_inflight_ipc_.reset();
       }
-      auto sess = std::make_unique<AttSession>();
-      sess->handle = handle;
-      sess->peer = addr_str;
-      sess->device_id = device_id;
-      sess->ipc = std::move(ipc);
-      sess->link.set_conn_handle(handle);
-      sess->link.set_peer(addr_str, peer_type);
-
-      waydroid_bt::BridgeIpc* ipc_ptr = sess->ipc.get();
-      const std::string dev = device_id;
-      waydroid_bt::AttHostOps ops;
-      ops.read_char = [ipc_ptr, dev](const std::string& cu, const std::string& su,
-                                     std::vector<uint8_t>* v) {
-        return ipc_ptr && ipc_ptr->gatt_read_uuid(dev, cu, su, v);
-      };
-      ops.write_char = [ipc_ptr, dev](const std::string& cu, const std::string& su,
-                                      const std::vector<uint8_t>& v, bool wr) {
-        return ipc_ptr && ipc_ptr->gatt_write_uuid(dev, cu, su, v, wr);
-      };
-      ops.set_notify = [ipc_ptr, dev](const std::string& cu, const std::string& su, bool en) {
-        const bool sn_ok = ipc_ptr && ipc_ptr->gatt_set_notify_uuid(dev, cu, su, en);
-        ALOGI("Soft HCI set_notify peer_dev=%s char=%s en=%d ok=%d", dev.c_str(), cu.c_str(),
-              en ? 1 : 0, sn_ok ? 1 : 0);
-        return sn_ok;
-      };
-      sess->link.set_host_ops(std::move(ops));
-
-      using HostTree =
-          std::vector<std::pair<std::string, std::vector<waydroid_bt::BridgeIpc::GattChar>>>;
-      auto has_uuid = [](const HostTree& svcs, const char* needle) {
-        for (const auto& s : svcs) {
-          std::string u = s.first;
-          for (char& c : u) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-          if (u.find(needle) != std::string::npos) return true;
-          for (const auto& c : s.second) {
-            std::string cu = c.uuid;
-            for (char& ch : cu) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
-            if (cu.find(needle) != std::string::npos) return true;
-          }
-        }
-        return false;
-      };
-      // Only complete a partial Pressensor tree when host already reported
-      // Pressensor UUIDs. Never invent Pressensor/Battery services on unrelated
-      // peers (Tesla, etc.) — that polluted Soft ATT and confused apps.
-      const bool looks_decent =
-          has_uuid(services, "fff0") || has_uuid(services, "fff4") || has_uuid(services, "36f5");
-      const bool looks_pressensor = has_uuid(services, "873ae82");
-      if (looks_pressensor) {
-        if (!has_uuid(services, "873ae82a")) {
-          ALOGI("Soft HCI ATT complete Pressensor service 873ae82a (host partial)");
-          services.push_back(
-              {"873ae82a-4c5a-4342-b539-9d900bf7ebd0",
-               {{"873ae82b-4c5a-4342-b539-9d900bf7ebd0", 0x12},
-                {"873ae82c-4c5a-4342-b539-9d900bf7ebd0", 0x0C},
-                {"873ae832-4c5a-4342-b539-9d900bf7ebd0", 0x0C}}});
-        }
-        if (!has_uuid(services, "873ae828")) {
-          services.push_back(
-              {"873ae828-4c5a-4342-b539-9d900bf7ebd0",
-               {{"873ae829-4c5a-4342-b539-9d900bf7ebd0", 0x12}}});
-        }
-        if (!has_uuid(services, "180f") && !has_uuid(services, "2a19")) {
-          services.push_back(
-              {"0000180f-0000-1000-8000-00805f9b34fb",
-               {{"00002a19-0000-1000-8000-00805f9b34fb", 0x12}}});
-        }
-      } else if (looks_decent) {
-        ALOGI("Soft HCI ATT Decent/fff0 tree — no Pressensor inject");
-      } else {
-        ALOGI("Soft HCI ATT host tree only (no synthetic Pressensor) peer=%s", addr_str);
-      }
-      ALOGI("Soft HCI ATT build peer=%s looks_decent=%d looks_pressensor=%d services=%zu "
-            "active_links=%zu",
-            addr_str, looks_decent ? 1 : 0, looks_pressensor ? 1 : 0, services.size(),
-            att_sessions_.size() + 1);
-
-      std::vector<std::pair<std::string, std::vector<waydroid_bt::SoftAttLink::CharSpec>>> att_svcs;
-      att_svcs.reserve(services.size());
-      for (const auto& s : services) {
-        std::vector<waydroid_bt::SoftAttLink::CharSpec> chars;
-        chars.reserve(s.second.size());
-        for (const auto& c : s.second) {
-          chars.push_back({c.uuid, c.properties});
-          ALOGI("Soft HCI ATT char peer=%s svc=%s uuid=%s props=0x%02x", addr_str, s.first.c_str(),
-                c.uuid.c_str(), static_cast<unsigned>(c.properties));
-        }
-        att_svcs.emplace_back(s.first, std::move(chars));
-      }
-      sess->link.build_from_uuids(att_svcs);
-      soft_.inject_le_connection_complete(0x00, handle, 0x00, peer_type, peer);
-      ALOGI("Soft HCI LE Connection Complete status=0x00 handle=0x%04x peer=%s multi-link OK",
-            handle, addr_str);
-
-      sess->notify_run.store(true);
-      const uint16_t h = handle;
-      sess->notify_thread = std::thread([this, h]() { attNotifyWorker(h); });
-      att_sessions_[handle] = std::move(sess);
+      break;
     }
   }
+  if (!ok) {
+    // Car / peer absent or link setup failed: NOT reported to the stack. The
+    // LE Create Connection stays pending (real-controller semantics) and the
+    // worker retries; the stack decides when to give up (Cancel).
+    ALOGW("Soft HCI bridge LE connect/GATT failed peer=%s summary=%s (stays pending)", addr_str,
+          summary.empty() ? "none" : summary.c_str());
+    // Closing the socket (ipc goes out of scope) makes the host drop any
+    // half-open link this attempt still owned.
+    return kAttemptFailed;
+  }
+
+  ALOGI("Soft HCI bridge %s", summary.c_str());
+  uint16_t handle = 0;
+  {
+    std::lock_guard<std::mutex> lock(att_mu_);
+    // Race: peer might have been connected by another path.
+    if (AttSession* existing = findSessionByPeerLocked(addr_str)) {
+      ALOGI("Soft HCI LE peer %s connected during open — drop duplicate host link", addr_str);
+      ipc->disconnect_device(device_id);
+      ipc->close();
+      soft_.inject_le_connection_complete_if(gen, 0x00, existing->handle, 0x00, peer_type, peer);
+      return kAttemptDone;
+    }
+    handle = allocConnHandleLocked();
+    if (handle == 0) {
+      ipc->disconnect_device(device_id);
+      ipc->close();
+      soft_.inject_le_connection_complete_if(gen, 0x0D, 0x0000, 0x00, peer_type, peer);
+      return kAttemptDone;
+    }
+    auto sess = std::make_unique<AttSession>();
+    sess->handle = handle;
+    sess->peer = addr_str;
+    sess->device_id = device_id;
+    sess->ipc = std::move(ipc);
+    sess->link.set_conn_handle(handle);
+    sess->link.set_peer(addr_str, peer_type);
+
+    waydroid_bt::BridgeIpc* ipc_ptr = sess->ipc.get();
+    const std::string dev = device_id;
+    waydroid_bt::AttHostOps ops;
+    ops.read_char = [ipc_ptr, dev](const std::string& cu, const std::string& su,
+                                   std::vector<uint8_t>* v) {
+      return ipc_ptr && ipc_ptr->gatt_read_uuid(dev, cu, su, v);
+    };
+    ops.write_char = [ipc_ptr, dev](const std::string& cu, const std::string& su,
+                                    const std::vector<uint8_t>& v, bool wr) {
+      return ipc_ptr && ipc_ptr->gatt_write_uuid(dev, cu, su, v, wr);
+    };
+    ops.set_notify = [ipc_ptr, dev](const std::string& cu, const std::string& su, bool en) {
+      const bool sn_ok = ipc_ptr && ipc_ptr->gatt_set_notify_uuid(dev, cu, su, en);
+      ALOGI("Soft HCI set_notify peer_dev=%s char=%s en=%d ok=%d", dev.c_str(), cu.c_str(),
+            en ? 1 : 0, sn_ok ? 1 : 0);
+      return sn_ok;
+    };
+    sess->link.set_host_ops(std::move(ops));
+
+    using HostTree =
+        std::vector<std::pair<std::string, std::vector<waydroid_bt::BridgeIpc::GattChar>>>;
+    auto has_uuid = [](const HostTree& svcs, const char* needle) {
+      for (const auto& s : svcs) {
+        std::string u = s.first;
+        for (char& c : u) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        if (u.find(needle) != std::string::npos) return true;
+        for (const auto& c : s.second) {
+          std::string cu = c.uuid;
+          for (char& ch : cu) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+          if (cu.find(needle) != std::string::npos) return true;
+        }
+      }
+      return false;
+    };
+    // Only complete a partial Pressensor tree when host already reported
+    // Pressensor UUIDs. Never invent Pressensor/Battery services on unrelated
+    // peers (Tesla, etc.) — that polluted Soft ATT and confused apps.
+    const bool looks_decent =
+        has_uuid(services, "fff0") || has_uuid(services, "fff4") || has_uuid(services, "36f5");
+    const bool looks_pressensor = has_uuid(services, "873ae82");
+    if (looks_pressensor) {
+      if (!has_uuid(services, "873ae82a")) {
+        ALOGI("Soft HCI ATT complete Pressensor service 873ae82a (host partial)");
+        services.push_back(
+            {"873ae82a-4c5a-4342-b539-9d900bf7ebd0",
+             {{"873ae82b-4c5a-4342-b539-9d900bf7ebd0", 0x12},
+              {"873ae82c-4c5a-4342-b539-9d900bf7ebd0", 0x0C},
+              {"873ae832-4c5a-4342-b539-9d900bf7ebd0", 0x0C}}});
+      }
+      if (!has_uuid(services, "873ae828")) {
+        services.push_back(
+            {"873ae828-4c5a-4342-b539-9d900bf7ebd0",
+             {{"873ae829-4c5a-4342-b539-9d900bf7ebd0", 0x12}}});
+      }
+      if (!has_uuid(services, "180f") && !has_uuid(services, "2a19")) {
+        services.push_back(
+            {"0000180f-0000-1000-8000-00805f9b34fb",
+             {{"00002a19-0000-1000-8000-00805f9b34fb", 0x12}}});
+      }
+    } else if (looks_decent) {
+      ALOGI("Soft HCI ATT Decent/fff0 tree — no Pressensor inject");
+    } else {
+      ALOGI("Soft HCI ATT host tree only (no synthetic Pressensor) peer=%s", addr_str);
+    }
+    ALOGI("Soft HCI ATT build peer=%s looks_decent=%d looks_pressensor=%d services=%zu "
+          "active_links=%zu",
+          addr_str, looks_decent ? 1 : 0, looks_pressensor ? 1 : 0, services.size(),
+          att_sessions_.size() + 1);
+
+    std::vector<std::pair<std::string, std::vector<waydroid_bt::SoftAttLink::CharSpec>>> att_svcs;
+    att_svcs.reserve(services.size());
+    for (const auto& s : services) {
+      std::vector<waydroid_bt::SoftAttLink::CharSpec> chars;
+      chars.reserve(s.second.size());
+      for (const auto& c : s.second) {
+        chars.push_back({c.uuid, c.properties});
+        ALOGI("Soft HCI ATT char peer=%s svc=%s uuid=%s props=0x%02x", addr_str, s.first.c_str(),
+              c.uuid.c_str(), static_cast<unsigned>(c.properties));
+      }
+      att_svcs.emplace_back(s.first, std::move(chars));
+    }
+    sess->link.build_from_uuids(att_svcs);
+    if (!soft_.inject_le_connection_complete_if(gen, 0x00, handle, 0x00, peer_type, peer)) {
+      // Stack cancelled while the host was connecting: drop the host link.
+      ALOGI("Soft HCI LE connect done but attempt gen=%llu was cancelled — drop host link peer=%s",
+            static_cast<unsigned long long>(gen), addr_str);
+      sess->ipc->disconnect_device(device_id);
+      sess->ipc->close();
+      return kAttemptStale;
+    }
+    ALOGI("Soft HCI LE Connection Complete status=0x00 handle=0x%04x peer=%s multi-link OK",
+          handle, addr_str);
+
+    sess->notify_run.store(true);
+    const uint16_t h = handle;
+    sess->notify_thread = std::thread([this, h]() { attNotifyWorker(h); });
+    att_sessions_[handle] = std::move(sess);
+  }
+  return kAttemptDone;
 }
 
 Return<void> BluetoothHci::sendAclData(const hidl_vec<uint8_t>& data) {

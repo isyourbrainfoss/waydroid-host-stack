@@ -17,8 +17,9 @@ use waydroid_bt_protocol::{
 };
 
 use crate::discovery::{
-    connect_scan_budget_from, guest_pair_discovery_transport, is_retryable_connect_error,
-    peer_presence, DiscoveryTransportName, PeerPresence, CONNECT_SCAN_SECS_ENV,
+    connect_retry_delay, connect_scan_budget_from, connect_scan_transport,
+    guest_pair_discovery_transport, is_retryable_connect_error, peer_presence,
+    DiscoveryTransportName, PeerPresence, CONNECT_SCAN_SECS_ENV,
 };
 use crate::policy::{PowerPolicy, ScanPolicy};
 
@@ -236,6 +237,12 @@ impl BlueZ {
         } else {
             Duration::from_millis(timeout_ms as u64)
         };
+        // One overall deadline for scan + every Connect attempt, so the guest
+        // always gets its answer within the timeout it asked for (before the
+        // Android stack gives up on its side). A missing car is a normal,
+        // quick failure; the guest HAL keeps the connection pending and asks
+        // again later, like a real controller would.
+        let deadline = tokio::time::Instant::now() + timeout;
         let scan_budget = connect_scan_budget_from(
             timeout,
             std::env::var(CONNECT_SCAN_SECS_ENV).ok().as_deref(),
@@ -248,7 +255,7 @@ impl BlueZ {
 
         let device = self.device_for_address(address).await?;
         let id = address.to_uppercase();
-        let mut retried = false;
+        let mut retries: u32 = 0;
         loop {
             // Already connected (guest reconnect / race after Soft HCI teardown): reuse.
             if device.is_connected().await.unwrap_or(false) {
@@ -256,20 +263,40 @@ impl BlueZ {
                 info!(%id, "LE device already connected — reuse");
                 return Ok((id, 23u32));
             }
-            debug!(%address, "connecting LE device");
-            match tokio::time::timeout(timeout, device.connect()).await {
-                Err(_) => return Err(anyhow!("connect timeout")),
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if left < Duration::from_millis(500) {
+                return Err(anyhow!("connect timeout (no time left after scan)"));
+            }
+            debug!(%address, left_ms = left.as_millis() as u64, "connecting LE device");
+            match tokio::time::timeout(left, device.connect()).await {
+                Err(_) => {
+                    // BlueZ keeps a timed-out Connect pending in the kernel;
+                    // the next attempt then aborts at once
+                    // (le-connection-abort-by-local). Cancel it explicitly.
+                    let cancel =
+                        tokio::time::timeout(Duration::from_secs(3), device.disconnect()).await;
+                    info!(%address, cancelled = matches!(cancel, Ok(Ok(()))),
+                          "connect_le: timed out, pending BlueZ connect cancelled");
+                    return Err(anyhow!("connect timeout"));
+                }
                 Ok(Ok(())) => break,
                 Ok(Err(e)) => {
                     let msg = e.to_string();
-                    if !retried && is_retryable_connect_error(&msg) {
-                        retried = true;
-                        warn!(%address, error = %msg, "connect_le: connect failed, rescanning and retrying once");
-                        tokio::time::sleep(Duration::from_millis(300)).await;
-                        self.ensure_device_known(address, scan_budget).await?;
-                        continue;
+                    let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+                    match connect_retry_delay(is_retryable_connect_error(&msg), retries, left) {
+                        Some(pause) => {
+                            retries += 1;
+                            warn!(%address, error = %msg, retry = retries,
+                                  "connect_le: connect failed, rescanning and retrying");
+                            tokio::time::sleep(pause).await;
+                            let left =
+                                deadline.saturating_duration_since(tokio::time::Instant::now());
+                            self.ensure_device_known(address, scan_budget.min(left / 2))
+                                .await?;
+                            continue;
+                        }
+                        None => return Err(anyhow!("device.connect: {msg}")),
                     }
-                    return Err(anyhow!("device.connect: {msg}"));
                 }
             }
         }
@@ -277,7 +304,7 @@ impl BlueZ {
         self.inner.devices.lock().await.insert(id.clone(), device);
         // MTU not always exposed via D-Bus; common LE default.
         let mtu = 23u32;
-        info!(%id, mtu, "LE device connected");
+        info!(%id, mtu, retries, "LE device connected");
         Ok((id, mtu))
     }
 
@@ -316,7 +343,7 @@ impl BlueZ {
             return Ok(());
         }
         let started = tokio::time::Instant::now();
-        let transport_name = guest_pair_discovery_transport();
+        let transport_name = connect_scan_transport();
         info!(
             %address,
             state = ?initial,

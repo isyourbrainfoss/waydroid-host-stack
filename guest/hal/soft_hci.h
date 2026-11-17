@@ -23,6 +23,12 @@ using ScanEnableHook = std::function<void(bool enable)>;
 // Caller must invoke inject_le_connection_complete when host path finishes.
 using LeCreateConnectionHook =
     std::function<void(const uint8_t peer_addr_le[6], uint8_t peer_addr_type)>;
+// Same, with the controller-side "attempt" generation and Initiator_Filter_Policy
+// (0x00 = direct to Peer_Address, 0x01 = background via Filter Accept List).
+// Complete with inject_le_connection_complete_if(gen, ...): it is a no-op once the
+// stack cancelled (LE Create Connection Cancel / Reset) or started a newer attempt.
+using LeCreateConnectionHookEx = std::function<void(
+    const uint8_t peer_addr_le[6], uint8_t peer_addr_type, uint64_t gen, uint8_t filter_policy)>;
 // HCI Disconnect for a Soft ATT handle — close host bridge for that link only.
 using DisconnectHook = std::function<void(uint16_t handle, uint8_t reason)>;
 
@@ -34,6 +40,9 @@ class SoftHci {
   void set_event_sink(EventSink sink);
   void set_scan_enable_hook(ScanEnableHook hook);
   void set_le_create_connection_hook(LeCreateConnectionHook hook);
+  // Preferred over the plain hook when set (keeps the connection pending like a
+  // real controller: no failure is reported for an absent peer until cancel).
+  void set_le_create_connection_hook_ex(LeCreateConnectionHookEx hook);
   void set_disconnect_hook(DisconnectHook hook);
   void reset();
   void handle_command(const Packet& cmd);
@@ -61,10 +70,35 @@ class SoftHci {
   // LE Create Connection surfaces as Android GATT 133.
   void inject_disconnection_complete(uint16_t handle, uint8_t reason = 0x16);
 
+  // Complete LE Create Connection attempt `gen` only if it is still the pending
+  // one. Returns false (emits nothing) after cancel / reset / newer attempt.
+  bool inject_le_connection_complete_if(uint64_t gen, uint8_t status, uint16_t handle,
+                                        uint8_t role, uint8_t peer_addr_type,
+                                        const uint8_t peer_addr_le[6]);
+
   bool inquiry_active() const;
   bool le_create_pending() const;
+  // Generation of the current/last LE Create Connection; bumped by every Create,
+  // Cancel and Reset.
+  uint64_t le_create_generation() const;
+  // True while attempt `gen` is still pending (not completed / cancelled).
+  bool le_create_pending_gen(uint64_t gen) const;
+  struct AcceptListPeer {
+    uint8_t addr_type = 0;
+    uint8_t addr_le[6] = {};
+  };
+  // Copy of the Filter Accept List (background connect targets), most recent last.
+  std::vector<AcceptListPeer> accept_list_snapshot() const;
 
   // Pure helpers (unit-tested):
+  // Pause before host connect retry `attempt` (1-based) of a pending LE Create
+  // Connection. Short at first (car just walked up to / stack direct connect),
+  // then a battery-friendly steady state for a long background connect while
+  // the peer is away: 2, 5, 10, 20, 30, 60, then 90 s.
+  static int pending_connect_retry_delay_ms(int attempt);
+  // Direct connects (policy 0x00) give up with 0x3E after this long without a
+  // cancel from the stack (safety net; GD normally cancels after 30 s).
+  static constexpr int kDirectConnectMaxMs = 60000;
   static Packet make_command_complete(uint16_t opcode, const Packet& return_params);
   static Packet make_command_status(uint8_t status, uint16_t opcode);
   static uint16_t opcode_of(const Packet& cmd);
@@ -96,6 +130,8 @@ class SoftHci {
   EventSink sink_;
   ScanEnableHook scan_hook_;
   LeCreateConnectionHook le_connect_hook_;
+  LeCreateConnectionHookEx le_connect_hook_ex_;
+  uint64_t le_create_gen_ = 0;
   DisconnectHook disconnect_hook_;
   mutable std::mutex mu_;
   bool open_ = false;

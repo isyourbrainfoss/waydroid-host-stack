@@ -19,8 +19,17 @@ if command -v g++ >/dev/null 2>&1; then
     ! /tmp/whs-soft-hci-test; then
     fail=1
   fi
+elif [ -n "${ANDROID_NDK_HOME:-}" ] && [ -x "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++" ]; then
+  # No host g++: NDK clang, static x86_64 Android binary (runs on the Linux host).
+  if ! "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++" \
+    --target=x86_64-linux-android33 -static -std=c++17 -O1 -I"$ROOT/guest/hal" \
+    "$ROOT/guest/hal/soft_hci_test.cpp" "$ROOT/guest/hal/soft_hci.cpp" \
+    "$ROOT/guest/hal/soft_hci_att.cpp" "$ROOT/guest/hal/bridge_ipc.cpp" \
+    -o /tmp/whs-soft-hci-test || ! /tmp/whs-soft-hci-test; then
+    fail=1
+  fi
 else
-  echo "skip: g++ not installed"
+  echo "skip: g++ not installed (set ANDROID_NDK_HOME to use NDK clang)"
 fi
 
 echo "=== desk-check: cargo test --workspace ==="

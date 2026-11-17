@@ -51,6 +51,17 @@ class BridgeIpc {
   bool connect(const char* path);
   void close();
   bool connected() const;
+  // Wake a thread blocked in a request on this socket (it then fails with EOF)
+  // without closing the fd under its feet. Used to abort a host connect attempt
+  // when the stack cancels LE Create Connection.
+  void shutdown_io();
+
+  // Ping (identify as client_name). Host clients whose name ends in
+  // "-keepalive" and that only ping get no events and do not count as active.
+  bool ping(const std::string& client_name, int timeout_ms = 3000);
+  // Keepalive idle wait: returns 1 if still attached after timeout_ms (any
+  // stray frames are read and dropped), 0 if the host closed the socket.
+  int keepalive_wait(int timeout_ms);
 
   // Start LE scan (active). Returns session_id or 0 on failure.
   uint32_t start_le_scan(bool active = true);
@@ -102,6 +113,7 @@ class BridgeIpc {
                                                const std::string& char_uuid,
                                                const std::string& service_uuid);
   static std::vector<uint8_t> encode_disconnect(uint64_t request_id, const std::string& device_id);
+  static std::vector<uint8_t> encode_ping(uint64_t request_id, const std::string& client_name);
   // Parse a single envelope payload (no 4-byte length prefix).
   static bool parse_start_le_scan_session(const uint8_t* data, size_t len, uint32_t* session_out);
   static bool parse_adv_report(const uint8_t* data, size_t len, BridgeAdv* out);

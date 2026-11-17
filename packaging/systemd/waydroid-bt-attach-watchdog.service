@@ -1,0 +1,17 @@
+[Unit]
+Description=Waydroid Bluetooth: restart the session if the guest HAL stays detached from the bridge
+Documentation=https://github.com/isyourbrainfoss/waydroid-host-stack/blob/main/docs/tesla-reconnect.md
+After=waydroid-bt-host.service
+# Also run once after every resume from suspend.
+After=suspend.target
+
+[Service]
+Type=oneshot
+# Installers rewrite @SBINDIR@ / @WAYDROID_USER@.
+Environment=WHS_USER=@WAYDROID_USER@
+ExecStart=@SBINDIR@/waydroid-bt-attach-watchdog.sh
+Nice=10
+IOSchedulingClass=idle
+
+[Install]
+WantedBy=suspend.target

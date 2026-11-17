@@ -7,7 +7,7 @@ use anyhow::Result;
 use bytes::Bytes;
 use futures::StreamExt;
 use tokio::sync::{mpsc, Mutex};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use waydroid_bt_protocol::{
     envelope, err_response, event, event_envelope, ok_response, request, response, AdvReportEvent,
     BtAddress, ConnectionState, ConnectionStateEvent, Envelope, ErrorCode, GattNotificationEvent,
@@ -27,7 +27,65 @@ pub struct BridgeService {
     next_client_id: std::sync::atomic::AtomicU64,
     /// Active notify tasks keyed by device_id + char uuid
     notify_tasks: Mutex<HashMap<String, tokio::task::JoinHandle<()>>>,
+    /// LE links opened by ConnectLe, keyed by device_id (upper case) -> the
+    /// IPC client that owns it. When that client goes away without a
+    /// Disconnect (guest HAL cancelled a pending connect mid-attempt, HAL
+    /// crash), the host link is dropped instead of dangling.
+    owned_links: Mutex<HashMap<String, u64>>,
     host_version: String,
+}
+
+/// What the IPC layer must know about a request before dispatch (pure).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RequestKind {
+    /// Ping (client name): identification / keepalive. Does not subscribe
+    /// to events.
+    Ping(String),
+    ConnectLe,
+    Disconnect(String),
+    Other,
+}
+
+pub(crate) fn request_kind(env: &Envelope) -> RequestKind {
+    match &env.body {
+        Some(envelope::Body::Request(r)) => match &r.op {
+            Some(request::Op::Ping(p)) => RequestKind::Ping(p.client_name.clone()),
+            Some(request::Op::ConnectLe(_)) => RequestKind::ConnectLe,
+            Some(request::Op::Disconnect(d)) => RequestKind::Disconnect(d.device_id.clone()),
+            _ => RequestKind::Other,
+        },
+        _ => RequestKind::Other,
+    }
+}
+
+/// Ping client names ending in "-keepalive" mark the guest HAL's persistent
+/// attachment (pure).
+pub(crate) fn is_keepalive_name(name: &str) -> bool {
+    name.ends_with("-keepalive")
+}
+
+/// device_id from a successful ConnectLe response (pure).
+pub(crate) fn connect_le_device_id(resp: &Envelope) -> Option<String> {
+    match &resp.body {
+        Some(envelope::Body::Response(r)) => match &r.result {
+            Some(response::Result::ConnectLe(c)) if !c.device_id.is_empty() => {
+                Some(c.device_id.to_ascii_uppercase())
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Links owned by `client` (pure helper — unit tested).
+pub(crate) fn links_owned_by(owned: &HashMap<String, u64>, client: u64) -> Vec<String> {
+    let mut v: Vec<String> = owned
+        .iter()
+        .filter(|(_, c)| **c == client)
+        .map(|(d, _)| d.clone())
+        .collect();
+    v.sort();
+    v
 }
 
 impl BridgeService {
@@ -38,8 +96,16 @@ impl BridgeService {
             event_sinks: Mutex::new(HashMap::new()),
             next_client_id: std::sync::atomic::AtomicU64::new(1),
             notify_tasks: Mutex::new(HashMap::new()),
+            owned_links: Mutex::new(HashMap::new()),
             host_version,
         }
+    }
+
+    /// Fresh id for LE-link ownership (one per IPC connection; shares the
+    /// event-sink counter so ids never collide).
+    pub fn next_link_owner_id(&self) -> u64 {
+        self.next_client_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Register a guest IPC client for unsolicited events. Returns client id.
@@ -67,6 +133,64 @@ impl BridgeService {
             for (_, h) in tasks.drain() {
                 h.abort();
             }
+        }
+    }
+
+    /// Dispatch a request from IPC client `client`, tracking which client
+    /// owns each LE link it opened.
+    pub async fn handle_from(&self, client: u64, env: Envelope) -> Result<Option<Envelope>> {
+        let kind = request_kind(&env);
+        let resp = self.handle(env).await?;
+        match kind {
+            RequestKind::ConnectLe => {
+                if let Some(dev) = resp.as_ref().and_then(connect_le_device_id) {
+                    self.owned_links.lock().await.insert(dev, client);
+                }
+            }
+            RequestKind::Disconnect(dev) => {
+                self.owned_links.lock().await.remove(&dev.to_ascii_uppercase());
+            }
+            _ => {}
+        }
+        Ok(resp)
+    }
+
+    /// Client socket closed: drop the LE links it still owned (it can no
+    /// longer drive them). Best effort, never fails the bridge.
+    pub async fn release_client_links(&self, client: u64) {
+        let devs = {
+            let mut owned = self.owned_links.lock().await;
+            let devs = links_owned_by(&owned, client);
+            for d in &devs {
+                owned.remove(d);
+            }
+            devs
+        };
+        for dev in devs {
+            {
+                let mut tasks = self.notify_tasks.lock().await;
+                for k in notify_task_keys_for_device(tasks.keys(), &dev) {
+                    if let Some(h) = tasks.remove(&k) {
+                        h.abort();
+                    }
+                }
+            }
+            let r = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                self.bluez.disconnect(&dev),
+            )
+            .await;
+            info!(device_id = %dev, ok = matches!(r, Ok(Ok(()))),
+                  "guest client gone: dropped its LE link");
+            self.emit(event_envelope(event::Payload::ConnectionState(
+                ConnectionStateEvent {
+                    device_id: dev.clone(),
+                    address: None,
+                    state: ConnectionState::Disconnected as i32,
+                    reason: "guest client gone".into(),
+                },
+            )))
+            .await;
         }
     }
 
@@ -110,7 +234,11 @@ impl BridgeService {
 
         let resp = match op {
             request::Op::Ping(req) => {
-                info!(client = %req.client_name, "ping");
+                if is_keepalive_name(&req.client_name) {
+                    debug!(client = %req.client_name, "ping");
+                } else {
+                    info!(client = %req.client_name, "ping");
+                }
                 ok_response(
                     request_id,
                     response::Result::Ping(PingResponse {
@@ -593,6 +721,65 @@ mod tests {
         assert!(normalize_bt_address("not-a-mac").is_none());
         assert!(normalize_bt_address("AA:BB:CC:DD:EE").is_none());
         assert!(normalize_bt_address("GG:HH:II:JJ:KK:LL").is_none());
+    }
+
+    fn ping_env(name: &str) -> Envelope {
+        Envelope {
+            request_id: 1,
+            body: Some(envelope::Body::Request(waydroid_bt_protocol::Request {
+                op: Some(request::Op::Ping(waydroid_bt_protocol::PingRequest {
+                    client_name: name.into(),
+                })),
+            })),
+        }
+    }
+
+    #[test]
+    fn request_kind_classifies() {
+        assert_eq!(
+            request_kind(&ping_env("soft-hci-keepalive")),
+            RequestKind::Ping("soft-hci-keepalive".into())
+        );
+        assert!(is_keepalive_name("soft-hci-keepalive"));
+        assert!(!is_keepalive_name("waydroid-bt-ping"));
+        let dc = Envelope {
+            request_id: 2,
+            body: Some(envelope::Body::Request(waydroid_bt_protocol::Request {
+                op: Some(request::Op::Disconnect(waydroid_bt_protocol::DisconnectRequest {
+                    device_id: "aa:bb:cc:dd:ee:01".into(),
+                })),
+            })),
+        };
+        assert_eq!(request_kind(&dc), RequestKind::Disconnect("aa:bb:cc:dd:ee:01".into()));
+        let empty = Envelope { request_id: 3, body: None };
+        assert_eq!(request_kind(&empty), RequestKind::Other);
+    }
+
+    #[test]
+    fn connect_le_device_id_only_on_success() {
+        let ok = ok_response(
+            7,
+            response::Result::ConnectLe(waydroid_bt_protocol::ConnectLeResponse {
+                device_id: "aa:bb:cc:dd:ee:01".into(),
+                mtu: 23,
+            }),
+        );
+        assert_eq!(connect_le_device_id(&ok).as_deref(), Some("AA:BB:CC:DD:EE:01"));
+        let err = err_response(7, ErrorCode::Bluez, "device not found after 12.0s scan");
+        assert_eq!(connect_le_device_id(&err), None);
+    }
+
+    #[test]
+    fn links_owned_by_filters_client() {
+        let mut m = HashMap::new();
+        m.insert("AA:BB:CC:DD:EE:02".to_string(), 5u64);
+        m.insert("AA:BB:CC:DD:EE:01".to_string(), 5u64);
+        m.insert("AA:BB:CC:DD:EE:03".to_string(), 6u64);
+        assert_eq!(
+            links_owned_by(&m, 5),
+            vec!["AA:BB:CC:DD:EE:01".to_string(), "AA:BB:CC:DD:EE:02".to_string()]
+        );
+        assert!(links_owned_by(&m, 9).is_empty());
     }
 
     #[test]
