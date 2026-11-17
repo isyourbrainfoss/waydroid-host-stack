@@ -1,0 +1,5 @@
+# Pinned to this exact BengalOS build: after an OS update the plugin is NOT merged
+# (systemd-sysext skips it), so an ABI change in phosh can never load a stale plugin.
+ID=bengalos
+VERSION_ID=0.26.1116.1
+ARCHITECTURE=arm64

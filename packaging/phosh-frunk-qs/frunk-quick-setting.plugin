@@ -1,0 +1,6 @@
+[Plugin]
+Id=frunk-quick-setting
+Name=Frunk
+Types=quick-setting;
+Comment=Open the Tesla front trunk via the Waydroid phone key (FP5)
+Plugin=/usr/lib/aarch64-linux-gnu/phosh/plugins/libphosh-plugin-frunk-quick-setting.so
