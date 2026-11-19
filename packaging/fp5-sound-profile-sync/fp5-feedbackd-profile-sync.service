@@ -1,0 +1,16 @@
+[Unit]
+Description=FP5: mirror feedbackd profile to Android sounds and GNOME event-sounds
+After=graphical-session.target
+# Ordering only: do not PartOf/BindsTo waydroid-session (we must keep running
+# across session restarts and re-apply when it comes back).
+After=waydroid-session.service
+Wants=waydroid-session.service
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/fp5-feedbackd-profile-sync
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=graphical-session.target

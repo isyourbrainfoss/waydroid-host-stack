@@ -1,0 +1,103 @@
+#!/bin/sh
+# User watcher: mirror org.sigxcpu.feedbackd profile into GNOME event-sounds
+# and Android (via fp5-android-sound-profile@.service). No zen_mode.
+# Re-applies when the profile changes and when the Waydroid session comes back.
+set -u
+
+UNIT_PREFIX=fp5-android-sound-profile
+LOGTAG=fp5-sound-sync
+LOCK=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/fp5-sound-sync.lock
+USER_STATUS=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/fp5-sound-sync.status
+
+log() { logger -t "$LOGTAG" -- "$*" 2>/dev/null || echo "$*"; }
+
+profile_now() {
+  gsettings get org.sigxcpu.feedbackd profile 2>/dev/null | tr -d "' \t"
+}
+
+map_verb() {
+  case "$1" in
+    silent) echo silent ;;
+    quiet) echo quiet ;;
+    *) echo full ;;
+  esac
+}
+
+apply_event_sounds() {
+  case "$1" in
+    silent|quiet) gsettings set org.gnome.desktop.sound event-sounds false ;;
+    *) gsettings set org.gnome.desktop.sound event-sounds true ;;
+  esac
+}
+
+waydroid_session_up() {
+  waydroid status 2>/dev/null | grep -q 'Session:[[:space:]]*RUNNING'
+}
+
+write_user_status() {
+  {
+    echo "profile=$1"
+    echo "verb=$2"
+    echo "event_sounds=$(gsettings get org.gnome.desktop.sound event-sounds 2>/dev/null | tr -d "' ")"
+    echo "applied_at=$(date --iso-8601=seconds 2>/dev/null || date)"
+    echo "android_rc=$3"
+  } > "$USER_STATUS.tmp"
+  mv "$USER_STATUS.tmp" "$USER_STATUS"
+}
+
+apply_once() {
+  p=$(profile_now)
+  [ -n "$p" ] || p=full
+  verb=$(map_verb "$p")
+  apply_event_sounds "$verb" || true
+  if systemctl start --no-ask-password "${UNIT_PREFIX}@${verb}.service"; then
+    write_user_status "$p" "$verb" 0
+    log "applied profile=$p verb=$verb event-sounds=$(gsettings get org.gnome.desktop.sound event-sounds 2>/dev/null | tr -d "' ")"
+    return 0
+  fi
+  rc=$(systemctl show -p ExecMainStatus --value "${UNIT_PREFIX}@${verb}.service" 2>/dev/null || echo start-denied)
+  write_user_status "$p" "$verb" "$rc"
+  log "apply-failed profile=$p verb=$verb rc=$rc"
+  return 1
+}
+
+apply_with_retry() {
+  # Subshell so flock is released when the apply/retry loop finishes.
+  (
+    if command -v flock >/dev/null 2>&1; then
+      flock 8
+    fi
+    n=0
+    while ! apply_once; do
+      n=$((n + 1))
+      if [ "$n" -lt 10 ]; then sl=2; else sl=15; fi
+      sleep "$sl"
+    done
+  ) 8>"$LOCK"
+}
+
+apply_with_retry &
+
+gsettings monitor org.sigxcpu.feedbackd profile | while read -r _; do
+  apply_with_retry
+done &
+mon_pid=$!
+
+prev=down
+waydroid_session_up && prev=up
+while sleep 5; do
+  if waydroid_session_up; then
+    if [ "$prev" != up ]; then
+      prev=up
+      log "waydroid-session back; re-apply"
+      apply_with_retry
+    fi
+  else
+    prev=down
+  fi
+done &
+poll_pid=$!
+
+term() { kill "$mon_pid" "$poll_pid" 2>/dev/null || true; }
+trap term INT TERM EXIT
+wait "$mon_pid"

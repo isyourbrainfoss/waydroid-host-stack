@@ -1,0 +1,18 @@
+// -> /etc/polkit-1/rules.d/60-fp5-android-sound-profile.rules (root:root 0644)
+// Lets user fp5 START only these four instances, nothing else.
+// No stop/restart, no other units, no run0, no wildcards.
+// subject.local/active are intentionally not required: the watcher is a systemd
+// user service (no seat), so those checks would deny every apply.
+polkit.addRule(function(action, subject) {
+    if (action.id == "org.freedesktop.systemd1.manage-units" &&
+        action.lookup("verb") == "start" &&
+        subject.user == "fp5") {
+        var unit = action.lookup("unit");
+        if (unit == "fp5-android-sound-profile@silent.service" ||
+            unit == "fp5-android-sound-profile@quiet.service" ||
+            unit == "fp5-android-sound-profile@full.service" ||
+            unit == "fp5-android-sound-profile@restore.service") {
+            return polkit.Result.YES;
+        }
+    }
+});

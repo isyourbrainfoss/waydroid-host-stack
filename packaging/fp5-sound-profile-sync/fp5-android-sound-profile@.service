@@ -1,0 +1,15 @@
+# Installed as /etc/systemd/system/fp5-android-sound-profile@.service
+# Root oneshot. Instance name is the verb: silent, quiet, full, or restore.
+# No extra arguments. Started by user fp5 via a narrow polkit start-only rule,
+# or directly as root by install/rollback.
+[Unit]
+Description=FP5: apply Android sound profile (%i)
+After=waydroid-container.service
+# Do not bind to the container: a restart of Waydroid must not stop this unit mid-apply
+# in a way that leaves the helper half-done; the user watcher re-applies when it is back.
+
+[Service]
+Type=oneshot
+ExecStart=/var/lib/waydroid-host-stack/sbin/fp5-android-sound-profile.sh %i
+TimeoutStartSec=30
+Nice=10
