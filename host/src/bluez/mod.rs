@@ -59,6 +59,14 @@ struct BlueZInner {
     power: PowerPolicy,
     /// device_id (address string) -> open device handle
     devices: Mutex<HashMap<String, Device>>,
+    /// device_id -> (when the LE link came up, GATT resolved since) for
+    /// drop-timing logs and the early-drop policy (crate::linkpolicy).
+    link_up: Mutex<HashMap<String, (tokio::time::Instant, bool)>>,
+    /// "Kick": wake every pending passive wait and try one active connect
+    /// (SIGUSR1 from tesla-frunk-root.sh when the Frunk tile is pressed).
+    kick: tokio::sync::Notify,
+    /// Number of passive waits currently armed (for the kick log line).
+    passive_pending: std::sync::atomic::AtomicUsize,
     #[allow(dead_code)]
     adapter_events: broadcast::Sender<AdapterInfo>,
 }
@@ -111,6 +119,9 @@ impl BlueZ {
                 adapter: RwLock::new(Some(adapter)),
                 power,
                 devices: Mutex::new(HashMap::new()),
+                link_up: Mutex::new(HashMap::new()),
+                kick: tokio::sync::Notify::new(),
+                passive_pending: std::sync::atomic::AtomicUsize::new(0),
                 adapter_events: tx,
             }),
         })
@@ -252,6 +263,72 @@ impl BlueZ {
         Ok(device)
     }
 
+    /// Wake all pending passive waits for one active connect attempt each.
+    /// Returns how many passive waits were pending.
+    pub fn kick(&self) -> usize {
+        let n = self
+            .inner
+            .passive_pending
+            .load(std::sync::atomic::Ordering::SeqCst);
+        self.inner.kick.notify_waiters();
+        n
+    }
+
+    async fn mark_link_up(&self, id: &str) {
+        self.inner
+            .link_up
+            .lock()
+            .await
+            .insert(id.to_uppercase(), (tokio::time::Instant::now(), false));
+    }
+
+    async fn mark_resolved(&self, id: &str) {
+        if let Some(e) = self.inner.link_up.lock().await.get_mut(&id.to_uppercase()) {
+            e.1 = true;
+        }
+    }
+
+    /// (how long the link has been / was up, GATT resolved) for `id`.
+    pub async fn link_age(&self, id: &str) -> Option<(Duration, bool)> {
+        self.inner
+            .link_up
+            .lock()
+            .await
+            .get(&id.to_uppercase())
+            .map(|(t, r)| (t.elapsed(), *r))
+    }
+
+    /// One active connect attempt for a peer we are passively waiting for
+    /// (kick). Short scan, then Device1.Connect with a bounded timeout; a
+    /// timed-out Connect is cancelled like in connect_le.
+    async fn kick_connect(&self, adapter: &Adapter, want: Address, address: &str) {
+        let started = tokio::time::Instant::now();
+        if self.connected_device(adapter, want).await.is_some() {
+            return;
+        }
+        if let Err(e) = self.ensure_device_known(address, Duration::from_secs(6)).await {
+            info!(error = %format!("{e:#}"), "kick: car not found in scan");
+            return;
+        }
+        let dev = match adapter.device(want) {
+            Ok(d) => d,
+            Err(e) => {
+                info!(error = %e, "kick: no device object");
+                return;
+            }
+        };
+        match tokio::time::timeout(Duration::from_secs(8), dev.connect()).await {
+            Ok(Ok(())) => info!(after_ms = started.elapsed().as_millis() as u64,
+                                "kick: active connect ok"),
+            Ok(Err(e)) => info!(error = %e, after_ms = started.elapsed().as_millis() as u64,
+                                "kick: active connect failed"),
+            Err(_) => {
+                let _ = tokio::time::timeout(Duration::from_secs(3), dev.disconnect()).await;
+                info!("kick: active connect timed out (cancelled)");
+            }
+        }
+    }
+
     pub async fn connect_le(&self, address: &str, timeout_ms: u32) -> Result<(String, u32)> {
         let timeout = if timeout_ms == 0 {
             Duration::from_secs(30)
@@ -282,6 +359,9 @@ impl BlueZ {
             if device.is_connected().await.unwrap_or(false) {
                 self.inner.devices.lock().await.insert(id.clone(), device);
                 info!(%id, "LE device already connected — reuse");
+                if self.link_age(&id).await.is_none() {
+                    self.mark_link_up(&id).await;
+                }
                 return Ok((id, 23u32));
             }
             let left = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -323,6 +403,7 @@ impl BlueZ {
         }
 
         self.inner.devices.lock().await.insert(id.clone(), device);
+        self.mark_link_up(&id).await;
         // MTU not always exposed via D-Bus; common LE default.
         let mtu = 23u32;
         info!(%id, mtu, retries, "LE device connected");
@@ -356,6 +437,9 @@ impl BlueZ {
         if let Some(dev) = self.connected_device(&adapter, want).await {
             self.inner.devices.lock().await.insert(id.clone(), dev);
             info!(%id, "LE device already connected — reuse");
+            if self.link_age(&id).await.is_none() {
+                self.mark_link_up(&id).await;
+            }
             return Ok((id, 23u32));
         }
 
@@ -381,6 +465,16 @@ impl BlueZ {
 
         let started = tokio::time::Instant::now();
         let deadline = started + wait;
+        struct Pending<'a>(&'a std::sync::atomic::AtomicUsize);
+        impl Drop for Pending<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        self.inner
+            .passive_pending
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let _pending = Pending(&self.inner.passive_pending);
         let connected = loop {
             if let Some(dev) = self.connected_device(&adapter, want).await {
                 break dev;
@@ -431,27 +525,47 @@ impl BlueZ {
                 }
                 _ = dev_ev => {}
                 _ = ad_ev => {}
+                // Frunk tile pressed: one active connect, stay armed.
+                _ = self.inner.kick.notified() => {
+                    info!("kick: active connect requested during passive wait");
+                    self.kick_connect(&adapter, want, address).await;
+                }
                 // Safety net only (missed signal); not a scan.
                 _ = tokio::time::sleep(PASSIVE_RECHECK) => {}
             }
         };
-        // Keep the kernel entry until bluetoothd's ATT bearer is up (GATT
-        // resolved): the kernel's auto-connect params hold a reference on the
-        // link, and dropping it before ATT holds one could let the idle link
-        // time out.
-        let resolved_by = tokio::time::Instant::now() + SERVICES_RESOLVED_WAIT;
-        while tokio::time::Instant::now() < resolved_by {
-            if connected.is_services_resolved().await.unwrap_or(false)
-                || !connected.is_connected().await.unwrap_or(false)
-            {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(250)).await;
-        }
-        arm.disarm();
+        // Hand the link to the guest AT ONCE (19 Nov field data: links that
+        // were held back here until GATT resolved often dropped first, and the
+        // guest never got them). The kernel auto-connect entry, which holds a
+        // reference on the link, is kept in the background until bluetoothd's
+        // ATT bearer is up (GATT resolved), the link drops, or 10 s pass.
+        let up_at = tokio::time::Instant::now();
         info!(%id, after_s = format!("{:.1}", started.elapsed().as_secs_f32()),
-              "LE device connected (kernel auto-connect)");
-        self.inner.devices.lock().await.insert(id.clone(), connected);
+              "LE device connected (kernel auto-connect): handing to guest now");
+        self.mark_link_up(&id).await;
+        self.inner.devices.lock().await.insert(id.clone(), connected.clone());
+        let me = self.clone();
+        let id2 = id.clone();
+        tokio::spawn(async move {
+            let mut arm = arm;
+            let resolved_by = up_at + SERVICES_RESOLVED_WAIT;
+            let mut outcome = "timeout";
+            while tokio::time::Instant::now() < resolved_by {
+                if connected.is_services_resolved().await.unwrap_or(false) {
+                    outcome = "resolved";
+                    me.mark_resolved(&id2).await;
+                    break;
+                }
+                if !connected.is_connected().await.unwrap_or(false) {
+                    outcome = "dropped";
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            arm.disarm();
+            info!(outcome, up_ms = up_at.elapsed().as_millis() as u64,
+                  "LE link hold: GATT resolve wait done, auto-connect entry released");
+        });
         Ok((id, 23u32))
     }
 

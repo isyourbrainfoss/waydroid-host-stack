@@ -6,9 +6,16 @@
  * The root side (tesla-frunk-root.sh) re-checks a live BLE link + the Tesla
  * phone-key notification before it sends anything.
  *
- * The tile is insensitive unless BlueZ shows a connected device carrying the
+ * The tile is "active" when BlueZ shows a connected device carrying the
  * Tesla VCSEC GATT service (same rule as tesla-frunk-root.sh). Works on the
  * lock screen like other custom quick settings.
+ *
+ * 2026-11-19 (FP5): the tile stays tappable when the car link is down. A tap
+ * then shows "Connecting…" and the root side asks waydroid-bt-host for an
+ * active connect and waits up to 10 s for link + phone key "Connected" before
+ * sending (same safety checks). Every press, ignored press and result is
+ * logged (g_message, no addresses). Repeated taps while a press is running are
+ * ignored (busy flag; the root side also holds a lock).
  *
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
@@ -38,6 +45,7 @@ struct _PhoshFrunkQuickSetting {
   GCancellable       *cancel;
   gboolean            car_up;
   gboolean            busy;
+  gboolean            link_at_press;
   guint               reset_id;
 };
 
@@ -47,7 +55,8 @@ static void
 update_state (PhoshFrunkQuickSetting *self)
 {
   phosh_quick_setting_set_active (PHOSH_QUICK_SETTING (self), self->car_up);
-  gtk_widget_set_sensitive (GTK_WIDGET (self), self->car_up && !self->busy);
+  /* Always tappable: a press with the link down triggers a connect attempt. */
+  gtk_widget_set_sensitive (GTK_WIDGET (self), TRUE);
   if (self->reset_id == 0)
     phosh_status_icon_set_info (self->info, self->car_up ? "Frunk" : "Frunk (no car)");
 }
@@ -157,9 +166,27 @@ on_status_read (GObject *source, GAsyncResult *res, gpointer data)
   self->busy = FALSE;
   update_state (self);
   switch (code) {
-  case 3:  show_result (self, "Car not connected"); break;
-  case 4:  show_result (self, "Waydroid not running"); break;
-  default: show_result (self, "Could not send"); break;
+  case 3:
+    if (self->link_at_press) {
+      g_message ("frunk-quick-setting: result: refused, car not connected (exit 3)");
+      show_result (self, "Car not connected");
+    } else {
+      g_message ("frunk-quick-setting: result: refused, car not reachable within 10 s (exit 3)");
+      show_result (self, "Car not found (10 s)");
+    }
+    break;
+  case 4:
+    g_message ("frunk-quick-setting: result: refused, Waydroid not running (exit 4)");
+    show_result (self, "Waydroid not running");
+    break;
+  case 6:
+    g_message ("frunk-quick-setting: result: ignored, another press running (exit 6)");
+    show_result (self, "Frunk busy");
+    break;
+  default:
+    g_message ("frunk-quick-setting: result: could not send (exit %d)", code);
+    show_result (self, "Could not send");
+    break;
   }
 }
 
@@ -176,6 +203,7 @@ on_start_done (GObject *source, GAsyncResult *res, gpointer data)
   if (err == NULL && g_subprocess_get_successful (G_SUBPROCESS (source))) {
     self->busy = FALSE;
     update_state (self);
+    g_message ("frunk-quick-setting: result: sent");
     show_result (self, "Frunk command sent");
     return;
   }
@@ -187,6 +215,7 @@ on_start_done (GObject *source, GAsyncResult *res, gpointer data)
   if (st == NULL) {
     self->busy = FALSE;
     update_state (self);
+    g_message ("frunk-quick-setting: result: could not send (status unknown)");
     show_result (self, "Could not send");
     return;
   }
@@ -199,18 +228,26 @@ on_clicked (PhoshFrunkQuickSetting *self)
   g_autoptr (GError) err = NULL;
   g_autoptr (GSubprocess) p = NULL;
 
-  if (self->busy || !self->car_up)
+  if (self->busy) {
+    g_message ("frunk-quick-setting: press ignored: busy (previous press still running)");
     return;
+  }
 
   p = g_subprocess_new (G_SUBPROCESS_FLAGS_STDOUT_SILENCE | G_SUBPROCESS_FLAGS_STDERR_SILENCE, &err,
                         "systemctl", "start", "--no-ask-password", "tesla-frunk.service", NULL);
   if (p == NULL) {
+    g_message ("frunk-quick-setting: press: could not start tesla-frunk.service: %s",
+               err ? err->message : "?");
     show_result (self, "Could not send");
     return;
   }
   self->busy = TRUE;
+  self->link_at_press = self->car_up;
+  g_message ("frunk-quick-setting: press: car link %s, starting tesla-frunk.service",
+             self->car_up ? "up" : "down (root side will try to connect, 10 s)");
   update_state (self);
-  phosh_status_icon_set_info (self->info, "Frunk…");
+  g_clear_handle_id (&self->reset_id, g_source_remove);
+  phosh_status_icon_set_info (self->info, self->car_up ? "Frunk…" : "Connecting…");
   g_subprocess_wait_async (p, self->cancel, on_start_done, self);
 }
 

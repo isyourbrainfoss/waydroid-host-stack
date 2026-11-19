@@ -3,6 +3,7 @@
 mod bluez;
 mod discovery;
 mod ipc;
+mod linkpolicy;
 mod policy;
 mod service;
 
@@ -95,6 +96,28 @@ async fn main() -> Result<()> {
             service_adv.emit_adv(session_id, snap).await;
         }
     });
+
+    // Kick (FP5 Frunk tile): SIGUSR1 -> one active connect for pending
+    // passive waits. Register the handler BEFORE advertising it in
+    // <socket dir>/features (an old bridge would die on SIGUSR1).
+    match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1()) {
+        Ok(mut sig) => {
+            let bluez_kick = bluez.clone();
+            tokio::spawn(async move {
+                while sig.recv().await.is_some() {
+                    let n = bluez_kick.kick();
+                    info!(pending_passive_waits = n, "kick (SIGUSR1): active connect requested");
+                }
+            });
+            if let Some(dir) = args.socket.parent() {
+                let f = dir.join("features");
+                if let Err(e) = std::fs::write(&f, crate::linkpolicy::features_line(std::process::id())) {
+                    tracing::warn!(error = %e, "could not write features file");
+                }
+            }
+        }
+        Err(e) => tracing::warn!(error = %e, "SIGUSR1 handler not installed; kick unavailable"),
+    }
 
     let server = IpcServer::new(args.socket, service);
     let result = server.run().await;

@@ -238,6 +238,12 @@ impl BridgeService {
     }
 
     /// Start (or restart) the link-loss watcher for `device_id`.
+    ///
+    /// 2026-11-19 (FP5 Tesla): the drop is logged with how long the link was
+    /// up. A link that drops early (crate::linkpolicy) and that the guest has
+    /// not started using gets one active reconnect; the guest keeps its
+    /// pending link and is not told. Otherwise (or if the reconnect fails)
+    /// the guest gets ConnectionState=Disconnected as before.
     async fn watch_link_loss(&self, device_id: &str) {
         let key = device_id.to_ascii_uppercase();
         let bluez = self.bluez.clone();
@@ -246,27 +252,67 @@ impl BridgeService {
         let watch = self.link_watch.clone();
         let dev = device_id.to_string();
         let key2 = key.clone();
+        let threshold = crate::linkpolicy::early_drop_threshold(
+            std::env::var(crate::linkpolicy::EARLY_DROP_ENV).ok().as_deref(),
+        );
         let h = tokio::spawn(async move {
-            if let Err(e) = bluez.wait_link_lost(&dev).await {
-                warn!(error = %format!("{e:#}"), "link-loss watch failed; no disconnect forwarding for this link");
+            let mut retried = false;
+            loop {
+                if let Err(e) = bluez.wait_link_lost(&dev).await {
+                    warn!(error = %format!("{e:#}"), "link-loss watch failed; no disconnect forwarding for this link");
+                    watch.lock().await.remove(&key2);
+                    return;
+                }
+                let age = bluez.link_age(&dev).await;
+                let streams = notify_task_keys_for_device(tasks.lock().await.keys(), &dev).len();
+                let action = crate::linkpolicy::drop_action(
+                    age.map(|a| a.0),
+                    age.map(|a| a.1).unwrap_or(false),
+                    streams,
+                    retried,
+                    threshold,
+                );
+                info!(device_id = %dev,
+                      up_ms = age.map(|a| a.0.as_millis() as u64),
+                      gatt_resolved = age.map(|a| a.1),
+                      notify_streams = streams, retried, action = action.as_str(),
+                      "LE link dropped");
+                if action == crate::linkpolicy::DropAction::Reconnect {
+                    retried = true;
+                    let t0 = tokio::time::Instant::now();
+                    match bluez
+                        .connect_le(&dev, crate::linkpolicy::EARLY_RECONNECT_TIMEOUT_MS)
+                        .await
+                    {
+                        Ok(_) => {
+                            info!(device_id = %dev, after_ms = t0.elapsed().as_millis() as u64,
+                                  "early drop: active reconnect ok, guest keeps its link");
+                            continue;
+                        }
+                        Err(e) => {
+                            info!(device_id = %dev, error = %format!("{e:#}"),
+                                  after_ms = t0.elapsed().as_millis() as u64,
+                                  "early drop: active reconnect failed");
+                        }
+                    }
+                }
+                info!(device_id = %dev, "LE link lost (BlueZ Connected=false): telling guest");
+                {
+                    let mut t = tasks.lock().await;
+                    for k in notify_task_keys_for_device(t.keys(), &dev) {
+                        if let Some(h) = t.remove(&k) {
+                            h.abort();
+                        }
+                    }
+                }
+                let env = link_lost_event(&dev);
+                let list: Vec<_> = sinks.lock().await.values().cloned().collect();
+                for tx in list {
+                    let _ = tx.send(env.clone()).await;
+                }
                 watch.lock().await.remove(&key2);
                 return;
             }
-            info!(device_id = %dev, "LE link lost (BlueZ Connected=false): telling guest");
-            {
-                let mut t = tasks.lock().await;
-                for k in notify_task_keys_for_device(t.keys(), &dev) {
-                    if let Some(h) = t.remove(&k) {
-                        h.abort();
-                    }
-                }
-            }
-            let env = link_lost_event(&dev);
-            let list: Vec<_> = sinks.lock().await.values().cloned().collect();
-            for tx in list {
-                let _ = tx.send(env.clone()).await;
-            }
-            watch.lock().await.remove(&key2);
         });
         if let Some(old) = self.link_watch.lock().await.insert(key, h) {
             old.abort();

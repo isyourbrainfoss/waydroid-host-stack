@@ -1,0 +1,11 @@
+Current Notification Manager state:
+  Notification List:
+    NotificationRecord(0x0abc: pkg=com.teslamotors.tesla user=UserHandle{0} id=1 tag=null importance=2 key=0|com.teslamotors.tesla|1|null|10123: Notification(channel=phone_key_service_channel shortcut=null))
+      extras={
+        android.title=String (Phone Key)
+        android.text=String (Searching)
+      }
+      actions={
+        [0] "Front Trunk" -> PendingIntent{...}
+      }
+  Snoozed notifications:

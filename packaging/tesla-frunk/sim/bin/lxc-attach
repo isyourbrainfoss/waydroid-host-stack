@@ -1,0 +1,6 @@
+#!/bin/sh
+# stub: never touches a real container
+case "$*" in
+  *dumpsys*) cat "$SIM/dumpsys" ;;
+  *"am broadcast"*) echo send >> "$SIM/sends"; sleep "${SIM_SEND_DELAY:-0}"; echo "Broadcast completed: result=0" ;;
+esac

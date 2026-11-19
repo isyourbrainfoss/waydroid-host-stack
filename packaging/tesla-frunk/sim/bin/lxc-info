@@ -1,0 +1,2 @@
+#!/bin/sh
+[ -e "$SIM/lxc_running" ] && echo "State:          RUNNING" || echo "State:          STOPPED"
