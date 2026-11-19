@@ -21,7 +21,7 @@ No addresses, VIN or names are logged anywhere.
 
 ## Install (on the phone, with Kristian's yes)
 
-See `setup.sh` (pinned to a commit + sha256). It downloads, verifies, runs `run0 sh install.sh`
+See `setup.sh` (pinned to commit fbd323680778a14498190f99558b6d69e2f05a30 + sha256). It downloads, verifies, runs `run0 sh install.sh`
 (password prompt), and does not restart anything unless `--restart-bridge` is given.
 
 * backup + `rollback.sh`: `/var/lib/fp5-backup/20261119-frunk-link/`
