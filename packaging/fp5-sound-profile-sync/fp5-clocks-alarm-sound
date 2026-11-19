@@ -3,9 +3,10 @@
 
 GNOME Clocks 51 (BengalOS libfeedback patch) rings via Lfb.Event
 ('alarm-clock-elapsed', important=true, loop). It does not use Gtk.MediaFile
-and does not pass sound_uri to feedbackd. On this phone TriggerFeedback
-(ssa{sv}i) returns UnknownMethod, so the alarm is silent even though
-org.gnome.clocks is in allow-important.
+and does not retry another D-Bus signature. allow-important already lists
+org.gnome.clocks. From 14:58 today TriggerFeedback (ssa{sv}i, and older
+signatures) returns UnknownMethod and no event id, so Clocks cannot ring
+even in full until that method works again.
 
 This helper watches org.gnome.clocks ring_time and, only while
 TriggerFeedback is broken, plays the alarm's sound_uri (else the

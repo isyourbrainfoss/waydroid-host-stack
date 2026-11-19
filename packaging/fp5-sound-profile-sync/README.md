@@ -86,14 +86,23 @@ restart. The original value is saved in
 ## GNOME Clocks alarms on silent
 
 Alarms must sound even in silent (Android/Phosh behaviour). GNOME Clocks
-triggers `alarm-clock-elapsed` via libfeedback with the `important` hint;
-`org.gnome.clocks` is already in `allow-important`. The full-profile theme
-entry uses `media-role` Alarm, so the event-role USB mute does not apply.
+rings only via libfeedback (`alarm-clock-elapsed`, `important=true`, loop);
+it does not fall back to Gtk.MediaFile and does not retry another D-Bus
+signature. `org.gnome.clocks` (the GApplication / desktop id; lowercase c)
+is already in `allow-important`, which is how feedbackd is supposed to play
+the full-profile Sound (`media-role` Alarm) even when the global profile is
+silent. The USB event-role mute does not apply to that role.
 
-On this image, feedbackd advertises `TriggerFeedback` (`ssa{sv}i`) but the
-call returns `UnknownMethod` (also breaks Phosh button feedback). Clocks
-then has no audio path. The user unit `fp5-clocks-alarm-sound.service`
-watches Clocks `ring_time` and, only while that D-Bus method stays broken,
-plays the alarm file with `media.role=Alarm`. No root, no feedbackd restart.
-When TriggerFeedback works again, the helper stays idle so the sound is not
-doubled. `rollback.sh` disables the unit.
+TriggerFeedback was working earlier (Clocks only logs failures; the 07:00
+alarm today left no error, and feedbackd accepted numeric event ids on
+previous days). From 14:58 today the method is advertised in introspection
+(`ssa{sv}i`) but every call — official signature, older `ssa{sv}` /
+`sa{sv}i`, and `fbcli` — returns `UnknownMethod` and no event id.
+`EndFeedback` and `Haptic.Vibrate` still work. Phosh `button-pressed` and
+Clocks timers from 15:37 on fail the same way, including in full profile.
+
+Until that D-Bus method works again, the user unit
+`fp5-clocks-alarm-sound.service` watches Clocks `ring_time` and plays the
+alarm file with `media.role=Alarm`. It stays idle once two consecutive
+TriggerFeedback probes return an id, so a later fix does not double-ring
+in full. No root, no feedbackd restart. `rollback.sh` disables the unit.
