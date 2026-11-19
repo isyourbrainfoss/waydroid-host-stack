@@ -26,6 +26,11 @@ as_fp5() {
 run systemctl --user -M ${FP5}@ disable --now fp5-feedbackd-profile-sync.service || true
 
 # Restore host event-sounds (saved, default true)
+# Restore Pulse/WirePlumber system-event mute (USB plug/unplug)
+if [ -x "$FP5_HOME/.local/bin/fp5-event-role-restore" ]; then
+  run as_fp5 "$FP5_HOME/.local/bin/fp5-event-role-restore" restore
+fi
+
 ev=true
 if [ -f "$B/host-restore.conf" ]; then
   ev=$(sed -n 's/^event_sounds=//p' "$B/host-restore.conf" | tail -n1)

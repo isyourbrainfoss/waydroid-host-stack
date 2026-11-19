@@ -1,0 +1,322 @@
+#!/usr/bin/env python3
+"""Mute or restore Pulse/PipeWire stream-restore entry
+sink-input-by-media-role:event (GNOME/Phosh "System sounds", libcanberra
+media.role=event). No root. Does not restart PipeWire or WirePlumber.
+"""
+from __future__ import annotations
+
+import ctypes
+import ctypes.util
+import os
+import sys
+import time
+from pathlib import Path
+
+PA_CHANNELS_MAX = 32
+PA_VOLUME_NORM = 0x10000
+PA_CONTEXT_READY = 4
+PA_CONTEXT_FAILED = 5
+PA_CONTEXT_TERMINATED = 6
+PA_UPDATE_REPLACE = 1
+PA_CHANNEL_POSITION_FRONT_LEFT = 1
+PA_CHANNEL_POSITION_FRONT_RIGHT = 2
+ENTRY = "sink-input-by-media-role:event"
+STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "fp5-sound-sync"
+RESTORE = STATE_DIR / "event-role-restore.conf"
+
+
+class PaChannelMap(ctypes.Structure):
+    _fields_ = [("channels", ctypes.c_uint8), ("map", ctypes.c_int * PA_CHANNELS_MAX)]
+
+
+class PaCVolume(ctypes.Structure):
+    _fields_ = [("channels", ctypes.c_uint8), ("values", ctypes.c_uint32 * PA_CHANNELS_MAX)]
+
+
+class Info(ctypes.Structure):
+    _fields_ = [
+        ("name", ctypes.c_char_p),
+        ("channel_map", PaChannelMap),
+        ("volume", PaCVolume),
+        ("device", ctypes.c_char_p),
+        ("mute", ctypes.c_int),
+    ]
+
+
+class PulseRestore:
+    def __init__(self):
+        self.lib = ctypes.CDLL(ctypes.util.find_library("pulse") or "libpulse.so.0")
+        lib = self.lib
+        lib.pa_threaded_mainloop_new.restype = ctypes.c_void_p
+        lib.pa_threaded_mainloop_get_api.argtypes = [ctypes.c_void_p]
+        lib.pa_threaded_mainloop_get_api.restype = ctypes.c_void_p
+        lib.pa_threaded_mainloop_start.argtypes = [ctypes.c_void_p]
+        lib.pa_threaded_mainloop_lock.argtypes = [ctypes.c_void_p]
+        lib.pa_threaded_mainloop_unlock.argtypes = [ctypes.c_void_p]
+        lib.pa_threaded_mainloop_wait.argtypes = [ctypes.c_void_p]
+        lib.pa_threaded_mainloop_signal.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        lib.pa_threaded_mainloop_stop.argtypes = [ctypes.c_void_p]
+        lib.pa_threaded_mainloop_free.argtypes = [ctypes.c_void_p]
+        lib.pa_context_new.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+        lib.pa_context_new.restype = ctypes.c_void_p
+        lib.pa_context_set_state_callback.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
+        lib.pa_context_connect.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int, ctypes.c_void_p]
+        lib.pa_context_get_state.argtypes = [ctypes.c_void_p]
+        lib.pa_context_get_state.restype = ctypes.c_int
+        lib.pa_context_disconnect.argtypes = [ctypes.c_void_p]
+        lib.pa_context_unref.argtypes = [ctypes.c_void_p]
+        lib.pa_context_errno.argtypes = [ctypes.c_void_p]
+        lib.pa_context_errno.restype = ctypes.c_int
+        lib.pa_strerror.argtypes = [ctypes.c_int]
+        lib.pa_strerror.restype = ctypes.c_char_p
+        lib.pa_ext_stream_restore_read.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
+        lib.pa_ext_stream_restore_read.restype = ctypes.c_void_p
+        lib.pa_ext_stream_restore_write.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.POINTER(Info),
+            ctypes.c_uint,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+        ]
+        lib.pa_ext_stream_restore_write.restype = ctypes.c_void_p
+        lib.pa_operation_unref.argtypes = [ctypes.c_void_p]
+
+        self.StateCB = ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.c_void_p)
+        self.ReadCB = ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.POINTER(Info), ctypes.c_int, ctypes.c_void_p)
+        self.SuccCB = ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p)
+
+        self.ml = lib.pa_threaded_mainloop_new()
+        api = lib.pa_threaded_mainloop_get_api(self.ml)
+        self.ctx = lib.pa_context_new(api, b"fp5-event-role-restore")
+        self._entries: list[Info] = []
+        self._success = 0
+
+        @self.StateCB
+        def on_state(c, userdata):
+            st = lib.pa_context_get_state(c)
+            if st in (PA_CONTEXT_READY, PA_CONTEXT_FAILED, PA_CONTEXT_TERMINATED):
+                lib.pa_threaded_mainloop_signal(self.ml, 0)
+
+        @self.ReadCB
+        def on_read(c, info, eol, userdata):
+            if eol:
+                lib.pa_threaded_mainloop_signal(self.ml, 0)
+                return
+            if info:
+                # copy out of the callback-owned struct; keep string buffers
+                src = info.contents
+                dst = Info()
+                dst.mute = src.mute
+                dst.channel_map = PaChannelMap.from_buffer_copy(src.channel_map)
+                dst.volume = PaCVolume.from_buffer_copy(src.volume)
+                if src.name:
+                    dst._name_keep = ctypes.create_string_buffer(src.name)
+                    dst.name = ctypes.cast(dst._name_keep, ctypes.c_char_p)
+                else:
+                    dst.name = None
+                if src.device:
+                    dst._dev_keep = ctypes.create_string_buffer(src.device)
+                    dst.device = ctypes.cast(dst._dev_keep, ctypes.c_char_p)
+                else:
+                    dst.device = None
+                self._entries.append(dst)
+
+        @self.SuccCB
+        def on_succ(c, success, userdata):
+            self._success = int(success)
+            lib.pa_threaded_mainloop_signal(self.ml, 0)
+
+        self._on_state = on_state
+        self._on_read = on_read
+        self._on_succ = on_succ
+        lib.pa_context_set_state_callback(self.ctx, on_state, None)
+        lib.pa_threaded_mainloop_lock(self.ml)
+        if lib.pa_context_connect(self.ctx, None, 0, None) != 0:
+            raise RuntimeError("pulse connect failed: %s" % self._err())
+        lib.pa_threaded_mainloop_start(self.ml)
+        while lib.pa_context_get_state(self.ctx) not in (
+            PA_CONTEXT_READY,
+            PA_CONTEXT_FAILED,
+            PA_CONTEXT_TERMINATED,
+        ):
+            lib.pa_threaded_mainloop_wait(self.ml)
+        if lib.pa_context_get_state(self.ctx) != PA_CONTEXT_READY:
+            raise RuntimeError("pulse not ready: %s" % self._err())
+
+    def _err(self) -> str:
+        return (self.lib.pa_strerror(self.lib.pa_context_errno(self.ctx)) or b"?").decode()
+
+    def close(self) -> None:
+        lib = self.lib
+        lib.pa_context_disconnect(self.ctx)
+        lib.pa_threaded_mainloop_unlock(self.ml)
+        lib.pa_threaded_mainloop_stop(self.ml)
+        lib.pa_context_unref(self.ctx)
+        lib.pa_threaded_mainloop_free(self.ml)
+
+    def read_all(self) -> list[Info]:
+        self._entries = []
+        op = self.lib.pa_ext_stream_restore_read(self.ctx, self._on_read, None)
+        if not op:
+            raise RuntimeError("stream_restore_read failed: %s" % self._err())
+        self.lib.pa_threaded_mainloop_wait(self.ml)
+        self.lib.pa_operation_unref(op)
+        return list(self._entries)
+
+    def find(self, name: str = ENTRY) -> Info | None:
+        want = name.encode()
+        for e in self.read_all():
+            if e.name == want:
+                return e
+        return None
+
+    def write(self, info: Info, apply_immediately: int = 1) -> None:
+        self._success = 0
+        op = self.lib.pa_ext_stream_restore_write(
+            self.ctx,
+            PA_UPDATE_REPLACE,
+            ctypes.byref(info),
+            1,
+            apply_immediately,
+            self._on_succ,
+            None,
+        )
+        if not op:
+            raise RuntimeError("stream_restore_write failed: %s" % self._err())
+        self.lib.pa_threaded_mainloop_wait(self.ml)
+        self.lib.pa_operation_unref(op)
+        if not self._success:
+            raise RuntimeError("stream_restore_write was not accepted")
+
+    def close_unlocked_ok(self):
+        pass
+
+
+def _default_info(mute: int, volumes: list[int] | None = None) -> Info:
+    info = Info()
+    info.name = ENTRY.encode()
+    info.device = None
+    info.mute = int(mute)
+    ch = 2
+    info.channel_map.channels = ch
+    info.channel_map.map[0] = PA_CHANNEL_POSITION_FRONT_LEFT
+    info.channel_map.map[1] = PA_CHANNEL_POSITION_FRONT_RIGHT
+    info.volume.channels = ch
+    vals = volumes or [PA_VOLUME_NORM, PA_VOLUME_NORM]
+    for i, v in enumerate(vals[:PA_CHANNELS_MAX]):
+        info.volume.values[i] = int(v)
+    return info
+
+
+def _info_vols(info: Info) -> list[int]:
+    return [int(info.volume.values[i]) for i in range(info.volume.channels)]
+
+
+def fmt_info(info: Info | None) -> str:
+    if info is None:
+        return "name=%s missing" % ENTRY
+    name = info.name.decode() if info.name else ""
+    return "name=%s mute=%s ch=%s vols=%s" % (
+        name,
+        int(info.mute),
+        int(info.volume.channels),
+        _info_vols(info),
+    )
+
+
+def save_original(pr: PulseRestore, force: bool = False) -> Path:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    if RESTORE.exists() and not force:
+        return RESTORE
+    info = pr.find()
+    if info is None:
+        mute, vols, existed = 0, [PA_VOLUME_NORM, PA_VOLUME_NORM], 0
+    else:
+        mute, vols, existed = int(info.mute), _info_vols(info), 1
+    lines = [
+        "captured_at=%s" % time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "name=%s" % ENTRY,
+        "existed=%s" % existed,
+        "mute=%s" % mute,
+        "channels=%s" % len(vols),
+        "volume=%s" % ",".join(str(v) for v in vols),
+    ]
+    tmp = RESTORE.with_suffix(".conf.tmp")
+    tmp.write_text("\n".join(lines) + "\n")
+    tmp.replace(RESTORE)
+    return RESTORE
+
+
+def load_original() -> tuple[int, list[int]]:
+    if not RESTORE.exists():
+        return 0, [PA_VOLUME_NORM, PA_VOLUME_NORM]
+    mute, vols = 0, [PA_VOLUME_NORM, PA_VOLUME_NORM]
+    for line in RESTORE.read_text().splitlines():
+        if line.startswith("mute="):
+            mute = int(line.split("=", 1)[1] or 0)
+        elif line.startswith("volume="):
+            raw = line.split("=", 1)[1].strip()
+            if raw:
+                vols = [int(x) for x in raw.split(",") if x != ""]
+    return mute, vols
+
+
+def apply_mute(pr: PulseRestore, mute: int, volumes: list[int] | None = None) -> Info:
+    existing = pr.find()
+    name_keep = ctypes.create_string_buffer(ENTRY.encode())
+    if existing is not None:
+        info = Info.from_buffer_copy(existing)
+        info.name = ctypes.cast(name_keep, ctypes.c_char_p)
+        info.device = existing.device
+        if volumes is not None:
+            info.volume.channels = len(volumes)
+            for i, v in enumerate(volumes):
+                info.volume.values[i] = int(v)
+        info.mute = int(mute)
+    else:
+        info = _default_info(mute, volumes)
+        info.name = ctypes.cast(name_keep, ctypes.c_char_p)
+    pr.write(info, apply_immediately=1)
+    got = pr.find()
+    if got is None or int(got.mute) != int(mute):
+        raise RuntimeError("write did not stick: %s" % fmt_info(got))
+    return got
+
+
+def main(argv: list[str]) -> int:
+    cmd = argv[1] if len(argv) > 1 else "show"
+    pr = PulseRestore()
+    try:
+        if cmd == "show":
+            print(fmt_info(pr.find()))
+            if RESTORE.exists():
+                print("saved-original %s" % RESTORE)
+                print(RESTORE.read_text().rstrip())
+            return 0
+        if cmd == "save":
+            path = save_original(pr)
+            print("saved", path)
+            print(path.read_text().rstrip())
+            print("current", fmt_info(pr.find()))
+            return 0
+        if cmd == "mute":
+            save_original(pr)
+            got = apply_mute(pr, 1)
+            print("muted", fmt_info(got))
+            return 0
+        if cmd == "restore":
+            save_original(pr)  # no-op if already saved
+            mute, vols = load_original()
+            got = apply_mute(pr, mute, vols)
+            print("restored", fmt_info(got))
+            return 0
+        print("usage: fp5-event-role-restore show|save|mute|restore", file=sys.stderr)
+        return 2
+    finally:
+        pr.close()
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

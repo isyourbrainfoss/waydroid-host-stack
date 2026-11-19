@@ -67,3 +67,18 @@ The helper now changes live state:
 
 Update on a phone that already has v1: as root, from this dir,
 `sh update-live.sh` (backs up the v1 helper, saves live restore values, applies silent).
+
+## System / event sounds (USB plug-unplug)
+
+`org.gnome.desktop.sound event-sounds=false` does not stop `gsd-power`'s
+libcanberra `power-plug` / `power-unplug` clicks on Phosh (no XSettings).
+Those streams have `media.role=event` and
+`module-stream-restore.id=sink-input-by-media-role:event`.
+
+The user watcher also mutes that Pulse ext-stream-restore entry in silent and
+quiet (and restores the saved mute/volume in full) via
+`~/.local/bin/fp5-event-role-restore`. No root, no PipeWire/WirePlumber
+restart. The original value is saved in
+`~/.local/state/fp5-sound-sync/event-role-restore.conf`.
+`ExecStop` and `rollback.sh` restore it. Alarm/ringtone feedbackd sounds use
+`media-role` Alarm/Ringtone, not `event`.

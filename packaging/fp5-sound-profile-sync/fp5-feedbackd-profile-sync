@@ -23,10 +23,25 @@ map_verb() {
   esac
 }
 
+EVENT_ROLE_TOOL=${EVENT_ROLE_TOOL:-$HOME/.local/bin/fp5-event-role-restore}
+
 apply_event_sounds() {
   case "$1" in
-    silent|quiet) gsettings set org.gnome.desktop.sound event-sounds false ;;
-    *) gsettings set org.gnome.desktop.sound event-sounds true ;;
+    silent|quiet)
+      gsettings set org.gnome.desktop.sound event-sounds false
+      # event-sounds is ignored by gsd-power on Phosh (no XSettings). Mute the
+      # Pulse stream-restore entry sink-input-by-media-role:event so new
+      # libcanberra / gsd-power plug-unplug streams start muted.
+      if [ -x "$EVENT_ROLE_TOOL" ]; then
+        "$EVENT_ROLE_TOOL" mute >/dev/null || log "event-role mute failed"
+      fi
+      ;;
+    *)
+      gsettings set org.gnome.desktop.sound event-sounds true
+      if [ -x "$EVENT_ROLE_TOOL" ]; then
+        "$EVENT_ROLE_TOOL" restore >/dev/null || log "event-role restore failed"
+      fi
+      ;;
   esac
 }
 

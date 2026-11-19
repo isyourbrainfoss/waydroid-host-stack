@@ -9,6 +9,8 @@ Wants=waydroid-session.service
 [Service]
 Type=simple
 ExecStart=%h/.local/bin/fp5-feedbackd-profile-sync
+# Restore system-event mute so rollback/disable does not leave USB plug sounds muted.
+ExecStop=%h/.local/bin/fp5-event-role-restore restore
 Restart=on-failure
 RestartSec=3
 

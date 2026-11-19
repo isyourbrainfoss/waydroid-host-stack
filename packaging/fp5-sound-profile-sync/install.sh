@@ -39,6 +39,7 @@ for f in \
   /etc/systemd/system/fp5-android-sound-profile@.service \
   /etc/polkit-1/rules.d/60-fp5-android-sound-profile.rules \
   $FP5_HOME/.local/bin/fp5-feedbackd-profile-sync \
+  $FP5_HOME/.local/bin/fp5-event-role-restore \
   $FP5_HOME/.config/systemd/user/fp5-feedbackd-profile-sync.service \
   $STATE
  do
@@ -96,6 +97,8 @@ install -o root -g root -m 0644 60-fp5-android-sound-profile.rules \
   /etc/polkit-1/rules.d/60-fp5-android-sound-profile.rules
 install -D -o "$FP5" -g "$FP5" -m 0755 fp5-feedbackd-profile-sync \
   $FP5_HOME/.local/bin/fp5-feedbackd-profile-sync
+install -D -o "$FP5" -g "$FP5" -m 0755 fp5-event-role-restore \
+  $FP5_HOME/.local/bin/fp5-event-role-restore
 install -D -o "$FP5" -g "$FP5" -m 0644 fp5-feedbackd-profile-sync.service \
   $FP5_HOME/.config/systemd/user/fp5-feedbackd-profile-sync.service
 
