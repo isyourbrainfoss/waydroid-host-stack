@@ -82,3 +82,18 @@ restart. The original value is saved in
 `~/.local/state/fp5-sound-sync/event-role-restore.conf`.
 `ExecStop` and `rollback.sh` restore it. Alarm/ringtone feedbackd sounds use
 `media-role` Alarm/Ringtone, not `event`.
+
+## GNOME Clocks alarms on silent
+
+Alarms must sound even in silent (Android/Phosh behaviour). GNOME Clocks
+triggers `alarm-clock-elapsed` via libfeedback with the `important` hint;
+`org.gnome.clocks` is already in `allow-important`. The full-profile theme
+entry uses `media-role` Alarm, so the event-role USB mute does not apply.
+
+On this image, feedbackd advertises `TriggerFeedback` (`ssa{sv}i`) but the
+call returns `UnknownMethod` (also breaks Phosh button feedback). Clocks
+then has no audio path. The user unit `fp5-clocks-alarm-sound.service`
+watches Clocks `ring_time` and, only while that D-Bus method stays broken,
+plays the alarm file with `media.role=Alarm`. No root, no feedbackd restart.
+When TriggerFeedback works again, the helper stays idle so the sound is not
+doubled. `rollback.sh` disables the unit.

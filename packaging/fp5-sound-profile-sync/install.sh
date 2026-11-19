@@ -40,7 +40,9 @@ for f in \
   /etc/polkit-1/rules.d/60-fp5-android-sound-profile.rules \
   $FP5_HOME/.local/bin/fp5-feedbackd-profile-sync \
   $FP5_HOME/.local/bin/fp5-event-role-restore \
+  $FP5_HOME/.local/bin/fp5-clocks-alarm-sound \
   $FP5_HOME/.config/systemd/user/fp5-feedbackd-profile-sync.service \
+  $FP5_HOME/.config/systemd/user/fp5-clocks-alarm-sound.service \
   $STATE
  do
   record "$f"
@@ -99,8 +101,12 @@ install -D -o "$FP5" -g "$FP5" -m 0755 fp5-feedbackd-profile-sync \
   $FP5_HOME/.local/bin/fp5-feedbackd-profile-sync
 install -D -o "$FP5" -g "$FP5" -m 0755 fp5-event-role-restore \
   $FP5_HOME/.local/bin/fp5-event-role-restore
+install -D -o "$FP5" -g "$FP5" -m 0755 fp5-clocks-alarm-sound \
+  $FP5_HOME/.local/bin/fp5-clocks-alarm-sound
 install -D -o "$FP5" -g "$FP5" -m 0644 fp5-feedbackd-profile-sync.service \
   $FP5_HOME/.config/systemd/user/fp5-feedbackd-profile-sync.service
+install -D -o "$FP5" -g "$FP5" -m 0644 fp5-clocks-alarm-sound.service \
+  $FP5_HOME/.config/systemd/user/fp5-clocks-alarm-sound.service
 
 systemctl daemon-reload
 # User manager only: does not restart running units
@@ -112,6 +118,7 @@ as_fp5 gsettings set org.gnome.desktop.sound event-sounds false
 /var/lib/waydroid-host-stack/sbin/fp5-android-sound-profile.sh silent
 
 systemctl --user -M ${FP5}@ enable --now fp5-feedbackd-profile-sync.service
+systemctl --user -M ${FP5}@ enable --now fp5-clocks-alarm-sound.service
 
 # Polkit self-check: can fp5 start the helper without a password?
 if as_fp5 systemctl start --no-ask-password fp5-android-sound-profile@silent.service; then

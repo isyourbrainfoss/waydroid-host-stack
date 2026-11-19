@@ -24,6 +24,7 @@ as_fp5() {
 
 # Stop and disable the user watcher first (no other services).
 run systemctl --user -M ${FP5}@ disable --now fp5-feedbackd-profile-sync.service || true
+run systemctl --user -M ${FP5}@ disable --now fp5-clocks-alarm-sound.service || true
 
 # Restore host event-sounds (saved, default true)
 # Restore Pulse/WirePlumber system-event mute (USB plug/unplug)

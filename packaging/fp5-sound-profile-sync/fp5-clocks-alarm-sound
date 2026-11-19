@@ -1,0 +1,345 @@
+#!/usr/bin/env python3
+"""Play GNOME Clocks alarm audio when feedbackd TriggerFeedback is broken.
+
+GNOME Clocks 51 (BengalOS libfeedback patch) rings via Lfb.Event
+('alarm-clock-elapsed', important=true, loop). It does not use Gtk.MediaFile
+and does not pass sound_uri to feedbackd. On this phone TriggerFeedback
+(ssa{sv}i) returns UnknownMethod, so the alarm is silent even though
+org.gnome.clocks is in allow-important.
+
+This helper watches org.gnome.clocks ring_time and, only while
+TriggerFeedback is broken, plays the alarm's sound_uri (else the
+freedesktop alarm-clock-elapsed sound) with media.role=Alarm — not event,
+so the USB event-role mute does not apply. Stops when ring_time changes
+or ring_minutes elapse. Logs times only, never alarm names or bodies.
+No root. Does not restart feedbackd/PipeWire.
+"""
+from __future__ import annotations
+
+import os
+import signal
+import subprocess
+import sys
+import threading
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+import gi
+
+gi.require_version("Gio", "2.0")
+gi.require_version("GLib", "2.0")
+from gi.repository import Gio, GLib
+
+DEFAULT_SOUND = "/usr/share/sounds/freedesktop/stereo/alarm-clock-elapsed.oga"
+APP_NAME = "fp5-clocks-alarm-sound"
+PROBE_INTERVAL = 60
+CHECK_INTERVAL = 1.0
+
+
+def log(msg: str) -> None:
+    ts = datetime.now().astimezone().strftime("%Y-%m-%dT%H:%M:%S%z")
+    print(f"{ts} {APP_NAME}: {msg}", flush=True)
+
+
+def parse_dt(value) -> datetime | None:
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        dt = value
+    else:
+        s = str(value).strip()
+        if not s:
+            return None
+        try:
+            dt = datetime.fromisoformat(s)
+        except ValueError:
+            return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=datetime.now().astimezone().tzinfo)
+    return dt
+
+
+def unpack_alarm(child) -> dict:
+    if isinstance(child, dict):
+        return child
+    if hasattr(child, "unpack"):
+        u = child.unpack()
+        if isinstance(u, dict):
+            return u
+    return {}
+
+
+def uri_to_path(uri: str | None) -> str | None:
+    if not uri:
+        return None
+    uri = str(uri)
+    try:
+        path, _ = GLib.filename_from_uri(uri)
+        return path
+    except Exception:
+        if uri.startswith("/") and Path(uri).is_file():
+            return uri
+        return None
+
+
+def list_alarms(settings: Gio.Settings) -> list[dict]:
+    out = []
+    try:
+        raw = settings.get_value("alarms")
+    except Exception as e:
+        log("failed to read alarms: %s" % e)
+        return out
+    n = raw.n_children()
+    for i in range(n):
+        d = unpack_alarm(raw.get_child_value(i))
+        rid = str(d.get("id") or i)
+        ring = parse_dt(d.get("ring_time"))
+        try:
+            mins = int(d.get("ring_minutes") or 5)
+        except (TypeError, ValueError):
+            mins = 5
+        if mins <= 0:
+            mins = 5
+        path = uri_to_path(d.get("sound_uri"))
+        out.append({"id": rid, "ring_time": ring, "ring_minutes": mins, "sound": path})
+    return out
+
+
+def triggerfeedback_works(bus: Gio.DBusConnection) -> bool:
+    try:
+        ret = bus.call_sync(
+            "org.sigxcpu.Feedback",
+            "/org/sigxcpu/Feedback",
+            "org.sigxcpu.Feedback",
+            "TriggerFeedback",
+            GLib.Variant("(ssa{sv}i)", ("org.example.fp5-alarm-probe", "button-pressed", {}, 1)),
+            GLib.VariantType("(u)"),
+            Gio.DBusCallFlags.NONE,
+            2000,
+            None,
+        )
+        ev_id = ret.unpack()[0]
+        try:
+            bus.call_sync(
+                "org.sigxcpu.Feedback",
+                "/org/sigxcpu/Feedback",
+                "org.sigxcpu.Feedback",
+                "EndFeedback",
+                GLib.Variant("(u)", (ev_id,)),
+                None,
+                Gio.DBusCallFlags.NONE,
+                2000,
+                None,
+            )
+        except Exception:
+            pass
+        return True
+    except Exception as e:
+        msg = str(e)
+        if "UnknownMethod" in msg or "not implemented" in msg.lower():
+            return False
+        # Other errors still mean we cannot rely on feedbackd for this alarm.
+        return False
+
+
+class Player:
+    def __init__(self) -> None:
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._proc: subprocess.Popen | None = None
+        self.key: tuple | None = None
+
+    def playing(self) -> bool:
+        return self._thread is not None and self._thread.is_alive()
+
+    def start(self, key: tuple, sound: str) -> None:
+        if self.playing() and self.key == key:
+            return
+        self.stop()
+        self._stop.clear()
+        self.key = key
+        self._thread = threading.Thread(target=self._loop, args=(sound,), daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        proc = self._proc
+        if proc and proc.poll() is None:
+            try:
+                proc.terminate()
+            except OSError:
+                pass
+        if self._thread:
+            self._thread.join(timeout=2)
+        self._thread = None
+        self._proc = None
+        self.key = None
+
+    def _loop(self, sound: str) -> None:
+        if not sound or not Path(sound).is_file():
+            sound = DEFAULT_SOUND
+        if not Path(sound).is_file():
+            log("no playable sound file")
+            return
+        log("playing media.role=Alarm")
+        while not self._stop.is_set():
+            try:
+                self._proc = subprocess.Popen(
+                    [
+                        "paplay",
+                        "--property=media.role=Alarm",
+                        "--property=media.name=alarm-clock-elapsed",
+                        f"--client-name={APP_NAME}",
+                        sound,
+                    ],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                while self._proc.poll() is None:
+                    if self._stop.wait(0.2):
+                        self._proc.terminate()
+                        try:
+                            self._proc.wait(timeout=1)
+                        except subprocess.TimeoutExpired:
+                            self._proc.kill()
+                        return
+            except FileNotFoundError:
+                log("paplay not found")
+                return
+            except Exception as e:
+                log("paplay failed")
+                time.sleep(0.5)
+            self._proc = None
+        log("stopped")
+
+
+class Guard:
+    def __init__(self) -> None:
+        self.settings = Gio.Settings.new("org.gnome.clocks")
+        self.bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+        self.player = Player()
+        self.tf_ok: bool | None = None
+        self._ok_streak = 0
+        self._last_probe = 0.0
+        self.loop = GLib.MainLoop()
+
+    def probe(self, force: bool = False) -> bool:
+        now = time.monotonic()
+        if not force and self.tf_ok is not None and (now - self._last_probe) < PROBE_INTERVAL:
+            return bool(self.tf_ok)
+        ok = triggerfeedback_works(self.bus)
+        if ok:
+            self._ok_streak += 1
+        else:
+            self._ok_streak = 0
+        confirmed = self._ok_streak >= 2
+        # A single successful probe is not enough to disarm (avoid a flaky
+        # success skipping the alarm). Two in a row means feedbackd is back.
+        if self.tf_ok is None or confirmed != self.tf_ok:
+            log("TriggerFeedback %s" % ("works, fallback idle" if confirmed else "broken, fallback armed"))
+        self.tf_ok = confirmed
+        self._last_probe = now
+        return confirmed
+
+    def tick(self) -> bool:
+        try:
+            self._tick()
+        except Exception as e:
+            log("tick error: %s" % type(e).__name__)
+        return True
+
+    def _tick(self) -> None:
+        now = datetime.now().astimezone()
+        alarms = list_alarms(self.settings)
+        due = None
+        for a in alarms:
+            rt = a["ring_time"]
+            if rt is None:
+                continue
+            elapsed = (now - rt).total_seconds()
+            if elapsed < -1:
+                continue
+            if elapsed <= a["ring_minutes"] * 60:
+                due = a
+                break
+        if due is None:
+            if self.player.playing():
+                log("ring window ended, stopping")
+                self.player.stop()
+            return
+        key = (due["id"], due["ring_time"].isoformat())
+        if self.probe():
+            if self.player.playing():
+                log("TriggerFeedback recovered, stopping fallback")
+                self.player.stop()
+            return
+        sound = due["sound"] if due["sound"] and Path(due["sound"]).is_file() else DEFAULT_SOUND
+        if not self.player.playing() or self.player.key != key:
+            log("alarm due at %s, fallback play" % due["ring_time"].isoformat())
+            self.player.start(key, sound)
+
+    def run(self) -> int:
+        def _stop(*_a):
+            self.player.stop()
+            self.loop.quit()
+
+        signal.signal(signal.SIGTERM, _stop)
+        signal.signal(signal.SIGINT, _stop)
+        self.settings.connect("changed::alarms", lambda *_: self.tick())
+        self.probe(force=True)
+        upcoming = []
+        for a in list_alarms(self.settings):
+            if a["ring_time"] and a["ring_time"] > datetime.now().astimezone():
+                upcoming.append(a["ring_time"].isoformat())
+        upcoming.sort()
+        log("next ring_time=%s" % (upcoming[0] if upcoming else "none"))
+        self.tick()
+        GLib.timeout_add(int(CHECK_INTERVAL * 1000), self.tick)
+        self.loop.run()
+        return 0
+
+
+def cmd_status() -> int:
+    settings = Gio.Settings.new("org.gnome.clocks")
+    bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+    ok = triggerfeedback_works(bus)
+    now = datetime.now().astimezone()
+    print("TriggerFeedback", "ok" if ok else "broken")
+    print("profile", Gio.Settings.new("org.sigxcpu.feedbackd").get_string("profile"))
+    n = 0
+    for a in list_alarms(settings):
+        rt = a["ring_time"]
+        if rt is None:
+            continue
+        n += 1
+        delta = (rt - now).total_seconds()
+        print("scheduled ring_time=%s in_sec=%.0f ring_minutes=%s has_sound=%s" % (
+            rt.isoformat(), delta, a["ring_minutes"], bool(a["sound"] and Path(a["sound"]).is_file())
+        ))
+    if n == 0:
+        print("scheduled ring_time=none")
+    return 0
+
+
+def cmd_probe() -> int:
+    bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+    ok = triggerfeedback_works(bus)
+    print("TriggerFeedback", "ok" if ok else "broken")
+    return 0 if ok else 1
+
+
+def main(argv: list[str]) -> int:
+    cmd = argv[1] if len(argv) > 1 else "run"
+    if cmd in ("run", "watch"):
+        return Guard().run()
+    if cmd == "status":
+        return cmd_status()
+    if cmd == "probe":
+        return cmd_probe()
+    print("usage: fp5-clocks-alarm-sound [run|status|probe]", file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
