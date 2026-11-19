@@ -47,3 +47,23 @@ Rollback: `run0 sh /var/lib/fp5-backup/20261119-sound-sync/rollback.sh --apply`
 
 No restarts of PipeWire, feedbackd, waydroid-session, phoc or greetd; no
 reboot; no sysext refresh. polkitd reloads rules by itself.
+
+## Live AudioService (19 Nov 2026 follow-up)
+
+`settings put system volume_*` and `mode_ringer` are persisted but Android 13's
+AudioService does not apply them live (they are loaded at boot). This image
+also has no `cmd audio set-ringer-mode` (only surround-format commands).
+
+The helper now changes live state:
+
+- ringer: `service call audio 40` (`setRingerModeExternal`; codes from this
+  image's `IAudioService$Stub`). 0=SILENT, 1=VIBRATE, 2=NORMAL.
+- stream volumes: `cmd media_session volume --stream N --set/--get`, verified
+  (and fallen back) with `service call audio 135/177`. Streams 5
+  (NOTIFICATION), 1 (SYSTEM) and 2 (RING) only. Music/alarm/voice are left
+  alone. On Android 13, NOTIFICATION is often aliased to RING.
+- charging/power sound Settings keys are still written; `charging_sounds_enabled`
+  is read live by the charging-sound code.
+
+Update on a phone that already has v1: as root, from this dir,
+`sh update-live.sh` (backs up the v1 helper, saves live restore values, applies silent).
