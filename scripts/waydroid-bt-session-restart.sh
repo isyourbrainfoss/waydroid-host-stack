@@ -70,6 +70,14 @@ if [ -z "$U" ]; then
 	fi
 fi
 [ -n "$U" ] || { log "skip: cannot determine Waydroid user (set WHS_USER)"; exit 0; }
+# fp5 20261120: never start the user manager from here. "systemctl --user -M user@"
+# opens a PAM login session; at boot it acquired the homed home half-active and
+# started user@UID with HOME=/ (no ~/.config units, keyring lost). Only talk to an
+# already running user manager.
+_uid=$(id -u "$U" 2>/dev/null || echo x)
+if ! systemctl is-active -q "user@$_uid.service" 2>/dev/null || [ ! -S "/run/user/$_uid/bus" ]; then
+	log "skip: user manager for $U not running (fp5 home-guard)"; echo "ok:session-not-active(no-user-manager)"; exit 0
+fi
 
 prop() { sed -n "s/^$1=//p" | head -n1; }
 

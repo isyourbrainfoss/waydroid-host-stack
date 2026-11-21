@@ -1,6 +1,15 @@
 #!/bin/sh
 # Selftest: waydroid-bt-attach-watchdog.sh decision table + a fake-systemctl run.
 set -u
+# User+mount namespace so we can create /run/user/UID/bus for the home-guard gate
+# without touching the host or the scripts under test.
+if [ "${WHS_TEST_NS:-}" != 1 ]; then
+	exec unshare --user --map-root-user --mount env WHS_TEST_NS=1 /bin/sh "$0" "$@"
+fi
+mount --make-rprivate / >/dev/null 2>&1 || true
+mount -t tmpfs tmpfs /run
+mkdir -p /run/user/60434
+python3 -c 'import socket; s=socket.socket(socket.AF_UNIX); s.bind("/run/user/60434/bus")'
 ROOT="$(CDPATH='' cd -- "$(dirname "$0")/.." && pwd)"
 H="$ROOT/scripts/waydroid-bt-attach-watchdog.sh"
 fail=0
@@ -35,6 +44,9 @@ cat >"$T/bin/systemctl" <<'F'
 #!/bin/sh
 echo "systemctl $*" >>"$FAKE_CALLS"
 case "$*" in
+"is-active -q user@"*)
+	[ "${FAKE_USER_MANAGER:-1}" = 1 ] && exit 0
+	exit 3 ;;
 *" restart "*) exit 0 ;;
 "--user -M "*" show "*)
 	echo "ActiveState=active"
@@ -42,7 +54,12 @@ case "$*" in
 esac
 exit 0
 F
-chmod +x "$T/bin/systemctl"
+cat >"$T/bin/id" <<'F'
+#!/bin/sh
+[ "$1" = "-u" ] && { echo "${FAKE_ID_UID:-60434}"; exit 0; }
+exit 1
+F
+chmod +x "$T/bin/systemctl" "$T/bin/id"
 now=$(date +%s)
 printf 'keepalive=0\never=1\nchanged=%s\n' $((now - 300)) >"$T/status"
 : >"$T/calls"
@@ -71,5 +88,8 @@ o5=$(run)
 # Disabled
 o6=$(WHS_ATTACH_WATCHDOG=0 sh "$H")
 case "$o6" in *disabled*) echo "ok disabled" ;; *) echo "FAIL disabled: $o6"; fail=1 ;; esac
+# Home-guard: skip when the user manager is not running.
+o7=$(FAKE_USER_MANAGER=0 run)
+case "$o7" in *'fp5 home-guard'*) echo "ok home-guard skip" ;; *) echo "FAIL home-guard: $o7"; fail=1 ;; esac
 
 [ "$fail" -eq 0 ] && echo ATTACH_WATCHDOG_SELFTEST_OK || { echo ATTACH_WATCHDOG_SELFTEST_FAILED; exit 1; }
